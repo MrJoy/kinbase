@@ -111,22 +111,22 @@
   "digest_field"
  ],
  "rights_basis": {
-  "authority_basis": "my role as VP of Engineering at Wander",
+  "authority_basis": "my role as VP of Engineering at Example Corp",
   "claimed_license": "CC0-1.0",
   "customer_or_employer_confidential_material": false,
   "independent_provenance_record": {
    "path": "tests/fixtures/auxiliary/GRANT.md",
    "sha256": "838df4d7cd956e3005eed288048569a4f202193deea737eba4de76cb79a3aa5b",
-   "statement": "Clauses 1-2: Jeremy McEntire of Wander attests that he holds or is authorised to grant rights in the five candidate documents, based on his role as VP of Engineering at Wander. This supplied human attestation is not independent verification of authorship or authority.",
+   "statement": "Clauses 1-2: Alex Doe of Example Corp attests that he holds or is authorised to grant rights in the five candidate documents, based on his role as VP of Engineering at Example Corp. This supplied human attestation is not independent verification of authorship or authority.",
    "attested_over_pool_digest": "5ba052b1c881b79707bc6e9769897f908a945d849a04c4052bd16e83bfb1e1b7",
    "attested_at": "2026-09-10T00:17:20Z"
   },
   "license_legalcode_sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
   "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
-  "named_rightsholder": "Jeremy McEntire",
+  "named_rightsholder": "Alex Doe",
   "permits_local_evaluation": true,
   "permits_transmission_to_pinned_model_provider": true,
-  "rightsholder_signature": "Signed: Jeremy McEntire; Name: Jeremy McEntire; Date: 2026-09-10T00:17:20Z (re-attestation over the post-rename digest 5ba052b1c881b79707bc6e9769897f908a945d849a04c4052bd16e83bfb1e1b7)",
+  "rightsholder_signature": "Signed: Alex Doe; Name: Alex Doe; Date: 2026-09-10T00:17:20Z (re-attestation over the post-rename digest 5ba052b1c881b79707bc6e9769897f908a945d849a04c4052bd16e83bfb1e1b7)",
   "tester_claim": "Every byte under sources/ first appeared in this lane, authored for this instrument; no third-party text is reproduced, quoted or adapted. This is a claim with a checkable commit history, not an independent proof of authority to grant a licence.",
   "why_incomplete": "The supplied human grant records the named rightsholder, asserted authority and signature, and clause 5 now cites the current reproducible pool digest. Tester cannot independently prove authorship, employment authority, signature authenticity or legal sufficiency; that residual is disclosed, not closed. RIGHTS.md still carries the pre-re-attestation status line: RIGHTS.md is block 2 of the digest preimage, so correcting its prose would move the pool digest and invalidate the very attestation the correction describes. The machine-readable state in this object is authoritative over that prose."
  },

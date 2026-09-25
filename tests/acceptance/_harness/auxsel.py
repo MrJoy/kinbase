@@ -131,7 +131,7 @@ def require_review(directory: Path, pool: dict, digest: str) -> dict:
     current = grant if digest in grant else (
         attestation.read_text(encoding="utf-8") if attestation.is_file() else ""
     )
-    if digest not in current or "Signed: Jeremy McEntire" not in current:
+    if digest not in current or "Signed: Alex Doe" not in current:
         missing.append(f"Validator must obtain founder-signed RE-ATTESTATION.md reaffirming GRANT.md over {digest}")
     selection = directory / "SELECTION.json"
     if not selection.is_file():

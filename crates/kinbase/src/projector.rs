@@ -2132,7 +2132,6 @@ fn direction_brief(
         statement.contains("transitional")
             || statement.contains("retir")
             || statement.contains("out of the monorepo")
-            || statement.contains("out of wander")
             || statement.contains("emergenc")
             || statement.contains("refactor out")
     };
@@ -2272,20 +2271,20 @@ mod brief_tests {
     fn a_repository_level_ruling_resolves_by_identity_and_delivers_its_rows() {
         let spec = company_fact(
             "architecture/delta-current-state-to-target/payment-spec-07",
-            "Delta — Payment — spec 07. wandercom/payment, largest and most mature.",
+            "Delta — Payment — spec 07. example/payment, largest and most mature.",
             &[],
             &[],
         );
         let owner = company_fact(
             "ownership/repo/payment",
-            "Target-state owner of wandercom/payment: Payment Service (spec 07). Status: live, refactoring.",
-            &["uuid-payment", "wandercom/payment"],
+            "Target-state owner of example/payment: Payment Service (spec 07). Status: live, refactoring.",
+            &["uuid-payment", "example/payment"],
             &["row:architecture/delta-current-state-to-target/payment-spec-07"],
         );
         let retiring = company_fact(
-            "ownership/repo/wander",
-            "Target-state owner of wandercom/wander: the retiring monorepo. Landing in wander/ is for emergencies only.",
-            &["uuid-wander", "wandercom/wander"],
+            "ownership/repo/monorepo",
+            "Target-state owner of example/monorepo: the retiring monorepo. Landing in monorepo/ is for emergencies only.",
+            &["uuid-monorepo", "example/monorepo"],
             &[],
         );
         let facts = vec![spec, owner, retiring];
@@ -2301,9 +2300,9 @@ mod brief_tests {
         assert_eq!(brief["target_state_owner"]["repository"]["logical_key"], "ownership/repo/payment");
         assert_eq!(brief["direction_by_ownership"][0]["logical_key"], "architecture/delta-current-state-to-target/payment-spec-07");
         assert!(brief["questions"].as_array().unwrap().is_empty());
-        let wander = direction_brief(&facts, &facts, "Fix a null check", "", "2026-09-13T00:00:00.000Z", "uuid-wander");
-        assert_eq!(wander["target_state_owner"]["status"], "resolved_repository");
-        assert_eq!(wander["questions"][0]["kind"], "ownership_conflict");
+        let monorepo = direction_brief(&facts, &facts, "Fix a null check", "", "2026-09-13T00:00:00.000Z", "uuid-monorepo");
+        assert_eq!(monorepo["target_state_owner"]["status"], "resolved_repository");
+        assert_eq!(monorepo["questions"][0]["kind"], "ownership_conflict");
         let nobody = direction_brief(&facts, &facts, "Fix a null check", "", "2026-09-13T00:00:00.000Z", "uuid-other");
         assert_eq!(nobody["target_state_owner"]["status"], "no_paths_named");
         assert!(nobody["target_state_owner"]["repository"].is_null());
@@ -2360,7 +2359,7 @@ mod brief_tests {
         );
         let live = company_fact(
             "architecture/delta-current-state-to-target/payment-spec-07",
-            "Delta — Payment — spec 07. wandercom/payment, largest and most mature.",
+            "Delta — Payment — spec 07. example/payment, largest and most mature.",
             &[],
             &[],
         );

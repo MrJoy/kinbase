@@ -102,7 +102,7 @@ pub const ATOM_KINDS: [&str; 14] = [
 /// Truth-value hierarchy, strongest first.
 ///
 /// The problem this solves: in a brownfield repository, frequency is not authority.
-/// `wander/` has more commits than any other repository and is being retired. Five
+/// `monorepo/` has more commits than any other repository and is being retired. Five
 /// implementations of one thing may exist and none of them be right. Nothing in the
 /// evidence itself says which signal wins, so a rank has to be carried explicitly.
 ///
@@ -110,7 +110,7 @@ pub const ATOM_KINDS: [&str; 14] = [
 /// is how much weight the claim carries when evidence disagrees.
 /// Whose word it is, which decides how high a fact may rank.
 ///
-/// Jeremy's point, and it is the ordering the company actually runs on: a directive
+/// the founder's point, and it is the ordering a company actually runs on: a directive
 /// he gives directly outranks his own architecture documents, which outrank
 /// everything else. And software is compromise, so none of this is absolute -- a
 /// higher standing demotes weaker evidence to `present`, it never deletes it. The
@@ -641,7 +641,7 @@ pub struct FactEvent {
     pub provenance: String,
     /// Paths this fact governs. A `directional` or `north_star` fact scoped to a
     /// path demotes the weaker evidence found under it, which is how "we are
-    /// retiring wander/" outweighs wander/ having the most commits.
+    /// retiring monorepo/" outweighs monorepo/ having the most commits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub governs_paths: Vec<String>,
     /// Spans of code this fact is about. An `interface` or `exemplar` fact is
@@ -700,7 +700,7 @@ pub struct UnknownEvent {
     pub provenance: String,
     /// Paths this fact governs. A `directional` or `north_star` fact scoped to a
     /// path demotes the weaker evidence found under it, which is how "we are
-    /// retiring wander/" outweighs wander/ having the most commits.
+    /// retiring monorepo/" outweighs monorepo/ having the most commits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub governs_paths: Vec<String>,
     /// Spans of code this fact is about. An `interface` or `exemplar` fact is

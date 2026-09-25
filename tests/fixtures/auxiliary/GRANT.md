@@ -5,13 +5,13 @@ in `pool.json`. The unsigned form of this document is `GRANT-TEMPLATE.md`.
 
 ---
 
-I, Jeremy McEntire, of Wander, state that:
+I, Alex Doe, of Example Corp, state that:
 
 1. I hold, or am authorised to grant rights in, the five documents under
    `tests/fixtures/auxiliary/sources/` whose SHA-256 digests are listed in
    `tests/fixtures/auxiliary/pool.json` under `candidates`.
 
-2. The basis of that authority is: my role as VP of Engineering at Wander.
+2. The basis of that authority is: my role as VP of Engineering at Example Corp.
 
 3. I dedicate those exact bytes to the public domain under CC0 1.0 Universal,
    the full text of which is at https://creativecommons.org/publicdomain/zero/1.0/legalcode
@@ -32,6 +32,6 @@ I, Jeremy McEntire, of Wander, state that:
    1f3d9db708ffcfe4c37f299e2d699e2f402f5a2e8c2f88d137c8e5e547295eb3, which named
    no reproducible preimage.
 
-Signed: Jeremy McEntire
-Name:   Jeremy McEntire
+Signed: Alex Doe
+Name:   Alex Doe
 Date:   2026-09-10T00:17:20Z

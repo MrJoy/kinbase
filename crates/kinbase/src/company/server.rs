@@ -2125,7 +2125,7 @@ fn snapshot(
     let readable = readable_scopes(auth, trust_state);
     let view = current_view(db, trust_state, now).map_err(|error| refuse(500, error))?;
     // A repository asks for its own direction, not the company's entire corpus.
-    // A ruling that governs `wandercom/sync` is not direction for `booking`:
+    // A ruling that governs `example/sync` is not direction for `booking`:
     // shipping it anyway made the snapshot grow with the estate until it passed
     // the client's body ceiling and no repository could refresh at all, and in
     // the meantime it filled every projection with other services' rulings. A
@@ -2305,7 +2305,7 @@ fn snapshot(
 /// queue Company reduced.
 /// How many admitted events one snapshot carries. The snapshot's `facts` are
 /// Company's current view and are always complete; `events` are the inputs that
-/// view reduced, and an append-only log has no upper bound. Wander's Company
+/// view reduced, and an append-only log has no upper bound. A large deployment's Company
 /// store reached 1.7 MB and the client's body ceiling refused every refresh --
 /// the cache froze at the last snapshot that happened to fit, which is the worst
 /// possible failure because it looks like nothing is wrong. Older events stay

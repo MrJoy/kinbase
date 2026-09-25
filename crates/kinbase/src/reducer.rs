@@ -196,7 +196,7 @@ pub struct CurrentView {
 /// same-rank disagreement is a conflict, never a vote.
 /// Which paths a ruling governs, and how hard it demotes what lives under them.
 ///
-/// The problem: `wander/` has more commits than any other repository at Wander and
+/// The problem: `monorepo/` has more commits than any other repository in that deployment and
 /// is being retired. Every one of those commits is real evidence that code exists
 /// and what it does. None of it is evidence that anyone still wants it. Outranking
 /// that crowd one comparison at a time is not enough -- a `directional` fact scoped
@@ -255,7 +255,7 @@ impl Governance {
     /// evidence reference. Matching only the last of those was the reason
     /// governance never fired on real ingested corpora -- the repository adapter
     /// writes `scope: "repository"` and opaque `observation:` references, so no
-    /// ruling about `wandercom/property` could ever reach the facts it governs.
+    /// ruling about `example/property` could ever reach the facts it governs.
     fn governing_rule(&self, event: &FactEvent) -> Option<&(String, String, String)> {
         // The first rule, in build order, whose path matches and which is not the
         // event's own fact: the earliest such index across the matching paths.
@@ -338,7 +338,7 @@ pub fn authority_rank_governed(
     governance: Option<&Governance>,
 ) -> u8 {
     // A declared standing dominates where the fact happens to live. This is what
-    // lets "we are retiring wander/" outweigh wander/ having more commits than any
+    // lets "we are retiring monorepo/" outweigh monorepo/ having more commits than any
     // other repository: volume produces `present` evidence, a ruling produces
     // `ratified`, and the ruling wins without anyone counting.
     //
@@ -2711,7 +2711,7 @@ mod packet10_tests {
         ruling.atom_kind = "north_star".to_owned();
         ruling.standing = "ratified".to_owned();
         ruling.provenance = "human".to_owned();
-        ruling.governs_paths = vec!["wandercom/property".to_owned()];
+        ruling.governs_paths = vec!["example/property".to_owned()];
 
         let make = |id: &str, standing: &str| {
             let mut fact = event(
@@ -2726,7 +2726,7 @@ mod packet10_tests {
             fact.fact_id = format!("fact_{id}");
             fact.standing = standing.to_owned();
             fact.provenance = "human".to_owned();
-            fact.evidence_refs = vec!["source:wandercom/property/src/x.ts".to_owned()];
+            fact.evidence_refs = vec!["source:example/property/src/x.ts".to_owned()];
             fact
         };
         let prevalent = make("majority", "prevalent");

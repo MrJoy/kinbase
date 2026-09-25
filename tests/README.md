@@ -226,7 +226,7 @@ expands one function into several, most visibly the nine frozen V-5 temporal row
 and the per-host V-9 functions. Verify with
 `tests/run-acceptance.sh --collect-only -q`.
 
-Finding 21 is closed with the supplied Jeremy McEntire grant as evidence.
+Finding 21 is closed with the supplied Alex Doe grant as evidence.
 The grant's original digest is superseded; `acceptance._harness.auxsel --verify`
 now verifies a precisely framed, reproducible pool identity. Auxiliary
 qualification remains `INVALID_HARNESS` until Validator obtains the founder's

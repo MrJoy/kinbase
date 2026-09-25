@@ -287,7 +287,7 @@
       "gates": [
         "V-3"
       ],
-      "required_work": "Supplied tests/fixtures/auxiliary/GRANT.md, signed Alex Doe of Example Corp at 2026-09-09T20:42:31Z, clauses 1-4, supplies the named rightsholder, asserted VP of Engineering authority, CC0 legal-code digest and both permissions. pool.json records the grant digest as closure evidence; auxsel verifies the reproducible pool. Tester did not author or modify the grant.",
+      "required_work": "Supplied tests/fixtures/auxiliary/GRANT.md, signed Jeremy McEntire of Wander at 2026-09-09T20:42:31Z, clauses 1-4, supplies the named rightsholder, asserted VP of Engineering authority, CC0 legal-code digest and both permissions. pool.json records the grant digest as closure evidence; auxsel verifies the reproducible pool. Tester did not author or modify the grant.",
       "status": "CLOSED",
       "title": "Auxiliary corpus human rights grant",
       "why_blocking": "A Tester assertion of authorship cannot independently prove authority to grant CC0."

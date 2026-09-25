@@ -196,7 +196,7 @@ pub struct CurrentView {
 /// same-rank disagreement is a conflict, never a vote.
 /// Which paths a ruling governs, and how hard it demotes what lives under them.
 ///
-/// The problem: `monorepo/` has more commits than any other repository in that deployment and
+/// The problem: `monorepo/` has more commits than any other repository in the deployment it was measured on, and
 /// is being retired. Every one of those commits is real evidence that code exists
 /// and what it does. None of it is evidence that anyone still wants it. Outranking
 /// that crowd one comparison at a time is not enough -- a `directional` fact scoped

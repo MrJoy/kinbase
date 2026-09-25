@@ -2128,16 +2128,34 @@ fn direction_brief(
     // The words a ruling uses when the code in front of the agent is not
     // where the work belongs: the module is transitional, the monorepo is
     // retiring, landing here is for emergencies, work refactors out.
-    let retiring = |statement: &str| -> bool {
+    //
+    // One clause used to hard-code a particular company's name here — a proper
+    // noun in a live predicate, so the tool classified one deployment's rulings
+    // and nobody else's. Deleting it alone would have narrowed the behaviour for
+    // that deployment and widened it for none, because every surviving clause is
+    // a fixed English phrase. The generic form derives the phrase from the
+    // governing repository's OWN name, so "move it out of <repo>" is recognised
+    // for every deployment rather than for one.
+    let retiring = |statement: &str, repository: &str| -> bool {
+        let out_of_named = {
+            let repository = repository.trim();
+            let leaf = repository.rsplit('/').next().unwrap_or(repository).trim();
+            !leaf.is_empty() && statement.contains(&format!("out of {leaf}"))
+        };
         statement.contains("transitional")
             || statement.contains("retir")
             || statement.contains("out of the monorepo")
             || statement.contains("emergenc")
             || statement.contains("refactor out")
+            || out_of_named
     };
     if let Some(row) = &repository_owner {
         let statement = row["statement"].as_str().unwrap_or_default();
-        if retiring(statement) {
+        let governed = row["subject"]
+            .as_str()
+            .or_else(|| row["path"].as_str())
+            .unwrap_or_default();
+        if retiring(statement, governed) {
             questions.push(json!({
                 "kind": "ownership_conflict",
                 "path": "",
@@ -2152,7 +2170,10 @@ fn direction_brief(
     }
     for owner in &owners {
         let statement = owner["row"]["statement"].as_str().unwrap_or_default();
-        if retiring(statement) {
+        // The per-path owner rows carry the governed path, which is the name the
+        // ruling would use in "move it out of <repo>".
+        let governed = owner["path"].as_str().unwrap_or_default();
+        if retiring(statement, governed) {
             questions.push(json!({
                 "kind": "ownership_conflict",
                 "path": owner["path"],

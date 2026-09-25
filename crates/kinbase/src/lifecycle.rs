@@ -730,7 +730,7 @@ fn path_revision(repo: &Repository, relpath: &str) -> Option<String> {
 /// Every other bulk adapter gives each observation a unique logical key --
 /// `git_history:commit:<sha>`, `repo_code:<path>` -- so two facts never contest
 /// the same key, no conflict is ever detected, and the ruling loop cannot fire
-/// on ingested evidence at all. one deployment's 83,655 facts produced zero questions.
+/// on ingested evidence at all. one deployment's corpus of 83,655 facts produced zero questions.
 /// A symbol name is a subject that several definitions can genuinely disagree
 /// about, and disagreement is what the reducer needs to see before it can ask a
 /// human which definition is current. Measured across seven services of one deployment:
@@ -1977,7 +1977,7 @@ fn scan_git_history(
     let mut scan = SourceScan::default();
     let default = repo.default_branch();
     // Ingest refuses a batch over 10,000 observations, and the adapter cannot page:
-    // `scan` never receives the checkpoint. the largest repository measured has 148,004
+    // `scan` never receives the checkpoint. The largest repository measured has 148,004
     // commits, so an unbounded walk produced nothing at all -- the whole batch was
     // refused and the repository ended up with no code history whatsoever.
     //
@@ -3413,8 +3413,9 @@ fn revocation_of(trust: &TrustFacts, observation: &Observation) -> Option<String
         // no authority left to warrant them. But a revocation is an event
         // that happened, with a time. When nothing has ever been revoked, a
         // registry that simply never named a per-repository owner is not a
-        // revocation, and reporting one made every certified repository at
-        // one deployment shows ~45,000 "revoked" unknowns over a store nobody revoked.
+        // revocation, and reporting one made every certified repository in the
+        // measured deployment show ~45,000 "revoked" unknowns over a store
+        // nobody had revoked.
         let nothing_revoked = trust.revocations.is_empty()
             && trust
                 .governing_revoked_keys

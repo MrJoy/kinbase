@@ -2,8 +2,8 @@
 
 ## Status: grant recorded; current-digest re-attestation and selection pending
 
-The supplied `GRANT.md` names Alex Doe of Example Corp, asserts authority based
-on his role as VP of Engineering at Example Corp, and is signed and dated
+The supplied `GRANT.md` names Jeremy McEntire of Wander, asserts authority based
+on his role as VP of Engineering at Wander, and is signed and dated
 2026-09-09T20:42:31Z. Clauses 1-4 identify the five candidate documents, dedicate
 them under CC0 1.0, and expressly permit local evaluation and transmission to
 the model provider named in the experiment manifest. `pool.json.rights_basis`

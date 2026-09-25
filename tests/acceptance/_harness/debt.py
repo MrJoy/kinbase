@@ -272,7 +272,7 @@ LEDGER: tuple[DebtEntry, ...] = (
     _closed(
         21, "Auxiliary corpus human rights grant", ("V-3",),
         "A Tester assertion of authorship cannot independently prove authority to grant CC0.",
-        "Supplied tests/fixtures/auxiliary/GRANT.md, signed Alex Doe of Example Corp "
+        "Supplied tests/fixtures/auxiliary/GRANT.md, signed Jeremy McEntire of Wander "
         "at 2026-09-09T20:42:31Z, clauses 1-4, supplies the named rightsholder, "
         "asserted VP of Engineering authority, CC0 legal-code digest and both permissions. "
         "pool.json records the grant digest as closure evidence; auxsel verifies the "

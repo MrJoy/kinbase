@@ -2305,7 +2305,7 @@ fn snapshot(
 /// queue Company reduced.
 /// How many admitted events one snapshot carries. The snapshot's `facts` are
 /// Company's current view and are always complete; `events` are the inputs that
-/// view reduced, and an append-only log has no upper bound. A large deployment's Company
+/// view reduced, and an append-only log has no upper bound. The reference deployment's Company
 /// store reached 1.7 MB and the client's body ceiling refused every refresh --
 /// the cache froze at the last snapshot that happened to fit, which is the worst
 /// possible failure because it looks like nothing is wrong. Older events stay

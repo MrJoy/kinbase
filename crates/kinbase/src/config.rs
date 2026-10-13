@@ -121,6 +121,10 @@ pub struct UserConfig {
     pub personal: PersonalConfig,
     pub company: Option<CompanyConfig>,
     pub classifier: Option<ClassifierConfig>,
+    /// `[secret_mask]`: known secrets masked before anything is written,
+    /// signed or printed (`crate::secret_mask`). `None` is off; only this
+    /// file can turn it on.
+    pub secret_mask: Option<crate::secret_mask::SecretMaskConfig>,
     pub hosts: HostsConfig,
     pub scanner: ScannerConfig,
     pub principal_id: String,
@@ -487,12 +491,18 @@ pub fn enforce_private_file(path: &Path, role: &str) -> Result<(), ContractError
 pub fn load_user_config() -> Result<Option<UserConfig>, ContractError> {
     let path = user_config_path();
     if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
+        crate::secret_mask::configure(None);
         return Ok(None);
     }
     enforce_private_file(&path, "user config")?;
     let text = std::fs::read_to_string(&path)
         .map_err(|error| ContractError::unreadable("user config", &error))?;
-    parse_user_config(&path, &text).map(Some)
+    let user = parse_user_config(&path, &text)?;
+    // The mask is installed by reading the user config and by nothing else:
+    // a repository's config, the environment and the process cwd cannot
+    // turn it on, off or narrower.
+    crate::secret_mask::configure(user.secret_mask.as_ref());
+    Ok(Some(user))
 }
 
 pub fn parse_user_config(path: &Path, text: &str) -> Result<UserConfig, ContractError> {
@@ -512,6 +522,7 @@ pub fn parse_user_config(path: &Path, text: &str) -> Result<UserConfig, Contract
             "hosts",
             "scanner",
             "identity",
+            "secret_mask",
         ],
         "user config",
     )?;
@@ -778,10 +789,73 @@ pub fn parse_user_config(path: &Path, text: &str) -> Result<UserConfig, Contract
         personal: PersonalConfig { data_root, kindex },
         company,
         classifier,
+        secret_mask: match table.get("secret_mask") {
+            None => None,
+            Some(value) => Some(secret_mask_section(value)?),
+        },
         hosts,
         scanner,
         principal_id,
         host_instance_id,
+    })
+}
+
+/// `[secret_mask]`: the env files whose values are masked, which names in
+/// them are secrets, and the shortest value worth masking.
+fn secret_mask_section(
+    value: &toml::Value,
+) -> Result<crate::secret_mask::SecretMaskConfig, ContractError> {
+    let section = value
+        .as_table()
+        .ok_or_else(|| config_error("[secret_mask] must be a table"))?;
+    closed_keys(section, &["files", "keys", "min_length"], "[secret_mask]")?;
+    let strings = |key: &str| -> Result<Option<Vec<String>>, ContractError> {
+        let Some(value) = section.get(key) else {
+            return Ok(None);
+        };
+        let malformed = || config_error(format!("secret_mask.{key} must be an array of strings"));
+        value
+            .as_array()
+            .ok_or_else(malformed)?
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(malformed))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    };
+    // There is no default file: a table that names none masks nothing.
+    let files = strings("files")?
+        .unwrap_or_default()
+        .iter()
+        .map(|file| {
+            // `~/` is the user's home, as the shell reads the same file.
+            let expanded = match file.strip_prefix("~/") {
+                Some(rest) => paths::home_dir().join(rest).to_string_lossy().into_owned(),
+                None => file.clone(),
+            };
+            absolute(&expanded, "secret_mask.files")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let keys = strings("keys")?;
+    if keys
+        .as_ref()
+        .is_some_and(|keys| keys.iter().any(|key| key.trim_matches('*').is_empty()))
+    {
+        return Err(config_error(
+            "secret_mask.keys holds an empty selector; name a variable or a fragment of one",
+        ));
+    }
+    let min_length = match section.get("min_length") {
+        None => crate::secret_mask::DEFAULT_MIN_LENGTH,
+        Some(value) => value
+            .as_integer()
+            .filter(|length| *length >= 1)
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| config_error("secret_mask.min_length must be a positive integer"))?,
+    };
+    Ok(crate::secret_mask::SecretMaskConfig {
+        files,
+        keys,
+        min_length,
     })
 }
 
@@ -1231,5 +1305,51 @@ mod personal_recall_build_tests {
         let plain = "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\n";
         let config = parse_user_config(Path::new("/private/example/config.toml"), plain).expect("parses");
         assert!(config.personal.kindex.is_none());
+    }
+}
+
+#[cfg(test)]
+mod secret_mask_config_tests {
+    use super::*;
+
+    fn parse(section: &str) -> Result<UserConfig, ContractError> {
+        let text = format!(
+            "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\n\n{section}"
+        );
+        parse_user_config(Path::new("/private/example/config.toml"), &text)
+    }
+
+    #[test]
+    fn an_absent_table_is_off_and_a_present_one_is_read_whole() {
+        assert!(parse("").unwrap().secret_mask.is_none());
+        let config = parse(
+            "[secret_mask]\nfiles = [\"/private/example/env\", \"~/.profile\"]\nkeys = [\"github\", \"AWS_*_KEY\"]\nmin_length = 12\n",
+        )
+        .unwrap()
+        .secret_mask
+        .unwrap();
+        assert_eq!(config.files[0], Path::new("/private/example/env"));
+        assert!(config.files[1].is_absolute() && config.files[1].ends_with(".profile"));
+        assert_eq!(config.keys.as_deref().unwrap(), ["github", "AWS_*_KEY"]);
+        assert_eq!(config.min_length, 12);
+        // No default file: a table that names none masks nothing.
+        let empty = parse("[secret_mask]\n").unwrap().secret_mask.unwrap();
+        assert!(empty.files.is_empty() && empty.keys.is_none());
+        assert_eq!(empty.min_length, crate::secret_mask::DEFAULT_MIN_LENGTH);
+    }
+
+    #[test]
+    fn a_malformed_table_is_refused_when_read() {
+        for section in [
+            "[secret_mask]\nfiles = [\"relative/env\"]\n",
+            "[secret_mask]\nfiles = \"/private/example/env\"\n",
+            "[secret_mask]\nkeys = [\"*\"]\n",
+            "[secret_mask]\nmin_length = 0\n",
+            "[secret_mask]\nmin_length = \"8\"\n",
+            "[secret_mask]\nenabled = false\n",
+            "secret_mask = \"off\"\n",
+        ] {
+            assert!(parse(section).is_err(), "accepted: {section}");
+        }
     }
 }

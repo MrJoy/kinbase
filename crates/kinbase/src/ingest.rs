@@ -175,7 +175,7 @@ pub fn ingest(
         && !crate::lifecycle::is_kindex_sqlite_source(source)
         && (source.join("events").is_dir() || source.is_file());
     let mut quarantine_records: Vec<NativeRecord> = Vec::new();
-    let scan = if !source_available {
+    let mut scan = if !source_available {
         if prior_observations.is_empty() {
             return Err(ContractError::refused(
                 "CONFIG_INVARIANT",
@@ -256,6 +256,7 @@ pub fn ingest(
             "observed_count": observed
         })));
     }
+    mask_known_secrets(&mut scan.records);
     let store = store_for_source(source_kind);
     let repository_id = (store == crate::StoreKind::Codebase)
         .then(|| crate::repository::repository_id(repo))
@@ -1326,4 +1327,32 @@ fn io_error(error: std::io::Error) -> ContractError {
         false,
         ExitCode::InternalFailure,
     )
+}
+
+/// Known secrets become `$NAME` before a byte of the scan is digested,
+/// stored, handed off or signed (`crate::secret_mask`), so the observation's
+/// content identity is the masked text. A record that carries its signer's
+/// signature (`.kin/events`, a signed answer) passes untouched: its bytes are
+/// another authority's, and rewriting them would fail its verification.
+fn mask_known_secrets(records: &mut [crate::lifecycle::SourceRecord]) {
+    let Some(table) = crate::secret_mask::active_table() else {
+        return;
+    };
+    for record in records
+        .iter_mut()
+        .filter(|record| record.signer.is_none() && !record.reducer_owned)
+    {
+        record.statement = crate::secret_mask::mask_text(&record.statement, &table);
+        if let Ok(text) = std::str::from_utf8(&record.content) {
+            let masked = crate::secret_mask::mask_text(text, &table);
+            if masked != text {
+                record.content = masked.into_bytes();
+            }
+        }
+        let mut attributes = Value::Object(std::mem::take(&mut record.attributes));
+        crate::secret_mask::mask_value_with(&mut attributes, &table);
+        if let Value::Object(map) = attributes {
+            record.attributes = map;
+        }
+    }
 }

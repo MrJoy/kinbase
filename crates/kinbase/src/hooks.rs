@@ -647,6 +647,34 @@ fn dispatch_event(
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // Known secrets in the envelope (a prompt, a tool input) become `$NAME`
+    // before anything below queues, records or echoes them
+    // (`crate::secret_mask`; installed when the launcher read the user
+    // config); identifiers such as `session_id` and `cwd` are never
+    // rewritten.
+    let secrets = crate::secret_mask::active_table();
+    let map = match &secrets {
+        Some(table) => {
+            let mut envelope = Value::Object(map);
+            crate::secret_mask::mask_value_with(&mut envelope, table);
+            match envelope {
+                Value::Object(map) => map,
+                _ => Map::new(),
+            }
+        }
+        None => map,
+    };
+    let mask_text = |text: &str| match &secrets {
+        Some(table) => crate::secret_mask::mask_text(text, table),
+        None => text.to_owned(),
+    };
+    let mask_values = |values: &mut Vec<Value>| {
+        if let Some(table) = &secrets {
+            for value in values.iter_mut() {
+                crate::secret_mask::mask_value_with(value, table);
+            }
+        }
+    };
     if event_type == "UserPromptSubmit" {
         // The prompt belongs to the repository the host names, not to
         // wherever this process happened to start.
@@ -756,7 +784,7 @@ fn dispatch_event(
                 // candidate's outcome goes there, not just the refusal. A
                 // held candidate is reported the same way and exits zero.
                 for line in crate::session::admission_lines(&checkpoint) {
-                    eprintln!("{line}");
+                    eprintln!("{}", mask_text(&line));
                 }
             }
             merge(&mut response, checkpoint);
@@ -783,7 +811,7 @@ fn dispatch_event(
                 .unwrap_or(0);
             if (failure.is_some() || held > 0) && !json {
                 for line in crate::session::admission_lines(&checkpoint) {
-                    eprintln!("{line}");
+                    eprintln!("{}", mask_text(&line));
                 }
             }
             merge(&mut response, checkpoint);
@@ -808,6 +836,11 @@ fn dispatch_event(
             })
             .collect()
     };
+    // Masked value by value before anything is bounded, encoded or framed,
+    // so the frame lengths describe the masked text.
+    mask_values(&mut canonical_facts);
+    mask_values(&mut unknowns);
+    mask_values(&mut start.trusted_company_facts);
     let bounded = bound_evidence(&canonical_facts, &unknowns, &start.trusted_company_facts);
     let stream_body = json!({
         "facts": encode(&bounded.facts),
@@ -827,6 +860,10 @@ fn dispatch_event(
         // The host response is a display document (it carries a measured
         // fractional connect time); the durable-record text rule does not
         // apply to it, JCS ordering and escaping do.
+        let mut response = response;
+        if let Some(table) = &secrets {
+            crate::secret_mask::mask_value_with(&mut response, table);
+        }
         if let Some(error) = admission_failure {
             return Err(error.with_output_document(response));
         }

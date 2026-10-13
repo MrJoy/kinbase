@@ -911,9 +911,20 @@ impl FactEvent {
     }
 
     /// Sign in place: sets `signer` and `signature` and freezes the document.
+    /// Known secrets are masked first (`crate::secret_mask`), so a secret
+    /// never enters a signed record: once signed, the bytes cannot change.
     pub fn sign(&mut self, key: &PrivateKey) -> Result<(), ContractError> {
         self.raw = None;
-        let signed = key.sign_document("fact-event", &self.to_value())?;
+        let mut document = self.to_value();
+        if crate::secret_mask::mask_value(&mut document) {
+            *self = serde_json::from_value(document.clone()).map_err(|error| {
+                ContractError::internal(format!(
+                    "masked fact event no longer parses: {}",
+                    crate::json::serde_error_text(&error)
+                ))
+            })?;
+        }
+        let signed = key.sign_document("fact-event", &document)?;
         self.signer = signed["signer"].as_str().unwrap_or_default().to_owned();
         self.signature = signed["signature"].as_str().unwrap_or_default().to_owned();
         self.raw = Some(signed);
@@ -967,9 +978,19 @@ impl UnknownEvent {
         self.raw.clone().unwrap_or_else(|| self.to_value())
     }
 
+    /// Sign in place, known secrets masked first (see `FactEvent::sign`).
     pub fn sign(&mut self, key: &PrivateKey) -> Result<(), ContractError> {
         self.raw = None;
-        let signed = key.sign_document("unknown-event", &self.to_value())?;
+        let mut document = self.to_value();
+        if crate::secret_mask::mask_value(&mut document) {
+            *self = serde_json::from_value(document.clone()).map_err(|error| {
+                ContractError::internal(format!(
+                    "masked unknown event no longer parses: {}",
+                    crate::json::serde_error_text(&error)
+                ))
+            })?;
+        }
+        let signed = key.sign_document("unknown-event", &document)?;
         self.signer = signed["signer"].as_str().unwrap_or_default().to_owned();
         self.signature = signed["signature"].as_str().unwrap_or_default().to_owned();
         self.raw = Some(signed);

@@ -354,7 +354,7 @@ impl PrivateStore {
         // `value_of` yields Null and `canonical_text` yields "" when serialisation
         // fails, so a failure here used to be written into the ledger as an empty
         // record and discovered much later as an unreadable row. Five of 1,297
-        // observations in Wander's corpus were lost that way. Refuse instead: an
+        // observations in one deployment's corpus were lost that way. Refuse instead: an
         // observation that cannot be serialised is a defect to surface, never a
         // blank to store.
         let value = serde_json::to_value(observation).map_err(|error| {

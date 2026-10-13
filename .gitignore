@@ -17,3 +17,6 @@ evidence/launch-orchestrator.sh
 evidence/orchestrator-brief.md
 
 /target/
+
+# Agent working notes: development scaffolding, not product.
+.brief/

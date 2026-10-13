@@ -110,10 +110,9 @@ pub const ATOM_KINDS: [&str; 14] = [
 /// is how much weight the claim carries when evidence disagrees.
 /// Whose word it is, which decides how high a fact may rank.
 ///
-/// the founder's point, and it is the ordering a company actually runs on: a directive
-/// the founder gives directly outranks the architecture documents they wrote
-/// he gives directly outranks his own architecture documents, which outrank
-/// everything else. And software is compromise, so none of this is absolute -- a
+/// The founder's point, and it is the ordering a company actually runs on: a directive
+/// the founder gives directly outranks the architecture documents they wrote, which
+/// outrank everything else. And software is compromise, so none of this is absolute -- a
 /// higher standing demotes weaker evidence to `present`, it never deletes it. The
 /// code that contradicts a north star stays retrievable and stops being direction.
 pub const AUTHORITY_TIERS: [&str; 3] = [

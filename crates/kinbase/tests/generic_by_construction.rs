@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 const EXCUSED_PREFIXES: &[&str] = &[
     "LICENSE",
     "README.md",
-    "docs/",     // states the project's sponsor and its own repository URL
+    "docs/",          // states the project's sponsor and its own repository URL
     "evidence/",      // attested: do not rewrite
     "spec/receipts/", // attested: do not rewrite
     // The auxiliary corpus is attested the same way, and more subtly: RIGHTS.md
@@ -64,6 +64,9 @@ const EXCUSED_PREFIXES: &[&str] = &[
     // is a deliberate history-rewrite decision, not a lint fix.
     "tests/fixtures/",
     "tests/acceptance/_harness/debt.py", // mirrors the attested debt catalogue
+    // Verifies the attested GRANT.md's signature line byte for byte, so it must
+    // carry the signer's name exactly as the excused fixture does.
+    "tests/acceptance/_harness/auxsel.py",
     // Local agent/graph state, not product.
     ".kin/",
     ".brief/",
@@ -71,6 +74,10 @@ const EXCUSED_PREFIXES: &[&str] = &[
     ".git/",
     "crates/kinbase/tests/generic_by_construction.rs", // names the tokens to forbid them
 ];
+
+/// Directory names skipped wherever they appear: installed dependencies, not
+/// this repository's text.
+const DEPENDENCY_DIRS: &[&str] = &[".venv", "venv", "node_modules", "__pycache__"];
 
 const SCANNED_EXTENSIONS: &[&str] = &[
     "rs", "md", "json", "toml", "py", "sh", "html", "txt", "yaml", "yml", "b64",
@@ -83,6 +90,9 @@ fn forbidden() -> Vec<(String, &'static str)> {
     // token for it whatsoever — the highest-value disclosure was unguarded.
     let surname = format!("{}{}", "McEn", "tire");
     let handle = format!("{}{}", "jandrewmc", "entire");
+    // `scan` lowercases each file before matching, so every token is lowercased
+    // here too; a mixed-case token could never match and its guard would be a
+    // claim nobody had watched fail.
     vec![
         (company, "a deployment's identity"),
         (surname, "PII: a named individual"),
@@ -90,6 +100,9 @@ fn forbidden() -> Vec<(String, &'static str)> {
         ("/users/".to_string(), "a developer-local path"),
         ("wanderrepos".to_string(), "a developer-local path"),
     ]
+    .into_iter()
+    .map(|(token, why)| (token.to_lowercase(), why))
+    .collect()
 }
 
 fn is_excused(relative: &str) -> bool {
@@ -108,6 +121,16 @@ fn scannable(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         if is_excused(&relative) {
+            continue;
+        }
+        // Dependency environments hold third-party text (package metadata names
+        // its authors); the documented acceptance setup creates tests/.venv.
+        if path.is_dir()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| DEPENDENCY_DIRS.contains(&n))
+        {
             continue;
         }
         if path.is_dir() {
@@ -207,28 +230,56 @@ fn the_probe_catches_its_own_positive_control() {
 
     let company = format!("{}{}", "wan", "der");
     let planted = nested.join("planted.md");
-    fs::write(&planted, format!("<!-- measured across seven {company} services -->\n"))
-        .expect("write planted file");
+    fs::write(
+        &planted,
+        format!("<!-- measured across seven {company} services -->\n"),
+    )
+    .expect("write planted file");
+    // The surname as a person writes it, mixed case: the token list once kept
+    // its case while `scan` lowercased the text, so this could never match.
+    let surname = format!("{}{}", "McEn", "tire");
+    let named = nested.join("named.md");
+    fs::write(&named, format!("Reviewed by A. {surname}.\n")).expect("write named file");
     let clean = nested.join("clean.rs");
-    fs::write(&clean, "// measured across seven services of one deployment\n")
-        .expect("write clean file");
+    fs::write(
+        &clean,
+        "// measured across seven services of one deployment\n",
+    )
+    .expect("write clean file");
     // An excused path must stay excused even while carrying the token.
     let excused = root.join("docs");
     fs::create_dir_all(&excused).expect("docs dir");
-    fs::write(excused.join("index.html"), format!("<p>A {company} project</p>\n"))
-        .expect("write excused file");
+    fs::write(
+        excused.join("index.html"),
+        format!("<p>A {company} project</p>\n"),
+    )
+    .expect("write excused file");
+
+    // A dependency environment is somebody else's text: the documented
+    // acceptance setup creates tests/.venv, whose packages name their authors.
+    let venv = root.join("tests").join(".venv").join("lib");
+    fs::create_dir_all(&venv).expect("venv dir");
+    fs::write(venv.join("vendored.py"), format!("# {company}\n")).expect("write venv file");
 
     let (scanned, offenders) = scan(&root);
-    // Three files planted; docs/ is excused by path, so two are scanned. That
-    // asymmetry is the point: it proves the exclusion list is doing work.
-    assert_eq!(scanned, 2, "expected to scan the two unexcused planted files");
+    // Five files planted; docs/ is excused by path and .venv by name, so three
+    // are scanned. That asymmetry is the point: it proves the exclusions work.
+    assert_eq!(
+        scanned, 3,
+        "expected to scan the three unexcused planted files"
+    );
     assert_eq!(
         offenders.len(),
-        1,
-        "the detector must flag the planted reference and nothing else, got: {offenders:?}"
+        2,
+        "the detector must flag the two planted references and nothing else, got: {offenders:?}"
     );
     assert!(
-        offenders[0].starts_with("crates/deep/planted.md:1"),
+        offenders[0].starts_with("crates/deep/named.md:1")
+            && offenders[0].ends_with("PII: a named individual"),
+        "surname not flagged: {offenders:?}"
+    );
+    assert!(
+        offenders[1].starts_with("crates/deep/planted.md:1"),
         "wrong file flagged: {offenders:?}"
     );
 

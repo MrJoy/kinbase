@@ -8,6 +8,17 @@ use serde_json::Value;
 /// compact key/value rendering of the top-level scalars plus the full
 /// document as a single JSON line for inspection.
 pub fn emit(value: &Value, json: bool) {
+    // Known secrets never reach the terminal or a caller's pipe
+    // (`crate::secret_mask`; `explain` and most commands print here).
+    let mut masked;
+    let value = match crate::secret_mask::active_table() {
+        Some(table) => {
+            masked = value.clone();
+            crate::secret_mask::mask_value_with(&mut masked, &table);
+            &masked
+        }
+        None => value,
+    };
     if json {
         println!("{}", single_line(value));
         return;

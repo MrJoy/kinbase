@@ -210,7 +210,11 @@ pub fn run(
     as_of: &crate::time::AsOf,
     json: bool,
 ) -> Result<(), ContractError> {
-    let projection = project(launcher, repo, task, decision, working_set, evidence_repos, as_of)?;
+    let mut projection =
+        project(launcher, repo, task, decision, working_set, evidence_repos, as_of)?;
+    // The projection quotes facts and the task verbatim; known secrets are
+    // masked before it is printed (`crate::secret_mask`).
+    crate::secret_mask::mask_value(&mut projection.result);
     if json {
         println!("{}", crate::json::canonical_text(&projection.result));
     } else {

@@ -1397,7 +1397,11 @@ impl PrivateStore {
                 ));
             }
         }
-        let record = crate::json::try_canonical_bytes(record)
+        // A task or decision text can quote a secret; it is masked before
+        // the log keeps it (`crate::secret_mask`).
+        let mut record = record.clone();
+        crate::secret_mask::mask_value(&mut record);
+        let record = crate::json::try_canonical_bytes(&record)
             .map_err(|error| {
                 ContractError::internal(format!("query record is not serialisable: {error}"))
             })

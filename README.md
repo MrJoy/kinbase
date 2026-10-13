@@ -198,6 +198,56 @@ with `kin.json`:
 These keys and the `recall` command are not part of `spec/cli.md`: they exist
 only in a `personal-recall` build, for testing.
 
+## Masking known secrets
+
+A secret you keep in a shell env file can reach a prompt, a transcript, a source file
+or a task text, and from there a signed event that can never be edited. Name the file
+in the user config (`~/.config/kinbase/config.toml`) and Kinbase writes `$NAME` in place
+of the value everywhere it would have kept or shown it:
+
+```toml
+[secret_mask]
+files = ["~/.profile"]                       # absolute or ~/; no default
+keys = ["OPENAI_API_KEY", "github", "AWS_*_KEY"]  # optional
+min_length = 8                               # optional; the default
+```
+
+- **Off unless configured.** With no `[secret_mask]`, or no `files`, nothing is
+  masked. Only the user config sets it: `.kin/kinbase.toml` has a closed key set and
+  is refused if it names `secret_mask`, and no environment variable turns it on, off
+  or narrower.
+- **Which lines.** Each line `[export ]NAME=VALUE`, with NAME matching
+  `[A-Za-z_][A-Za-z0-9_]*`. Matching surrounding quotes are stripped; an unquoted value
+  loses a trailing ` #comment`. A value holding `$` or a backtick (an expansion the
+  file cannot resolve) and a value shorter than `min_length` are skipped.
+- **Which names.** A `keys` entry selects every name that contains it, ignoring case,
+  with `*` matching any run, so a full name selects itself (and any longer name holding
+  it). Without `keys`, a name is selected when it contains any of `KEY`, `TOKEN`,
+  `SECRET`, `PASSWORD`, `PASSWD`, `PASS`, `PW`, `CREDENTIAL`, `AUTH`, `PRIVATE`, `SID`,
+  `DSN`, `WEBHOOK`, `COOKIE`, `CLIENT_ID`, `ACCOUNT_ID` or `API`
+  (`secret_mask::DEFAULT_KEY_PATTERNS`).
+- **Replacement.** Every occurrence of a value becomes `$NAME`, longest value first,
+  file order breaking ties. A value under two names masks to the first; a name defined
+  twice masks both values. Each value's JSON-escaped spelling is masked too.
+- **Where.** Before anything is digested, stored or signed: host prompts and tool
+  input from hook envelopes, `session observe` transcripts, every unsigned record an
+  `ingest` scan reads, the query log, and every `FactEvent` and `UnknownEvent` this
+  machine signs — the signature is computed over the masked text. Output: hook
+  responses and evidence, `project`, and every document printed through the common
+  output path (`explain`, `status`, …). Identifiers (`event_id`, `session_id`, `cwd`,
+  `logical_key`, …) are never rewritten. A record that already carries another
+  signer's signature (`.kin/events`, a signed answer) passes untouched, because
+  rewriting it would fail its verification.
+- **Freshness.** Parsed values are cached and re-read when a file's modification time
+  or size changes. A file that cannot be read is reported once per run as a
+  `secret-mask-file-unreadable` diagnostic naming the file and the error kind; it masks
+  nothing and never stops the command. No value is ever logged or put in an error.
+
+Enabling it changes the content identity of records that held a secret: the next
+`ingest` sees them as changed and records the masked text.
+
+This is the same `secret_mask` behaviour Kindex and signet-eval implement.
+
 ## Building and running
 
 ```

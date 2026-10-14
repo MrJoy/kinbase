@@ -3443,7 +3443,18 @@ fn revocation_of(trust: &TrustFacts, observation: &Observation) -> Option<String
     None
 }
 
-/// Derive facts and Unknowns from the whole observation ledger.
+/// The cohort `derive` derives an observation in: its logical key, or, with
+/// none, `source_kind:native_id`. A cohort's facts and states come from its
+/// own rows alone (`PrivateStore::observations_in_cohorts`).
+pub fn derivation_key(observation: &Observation) -> String {
+    observation
+        .logical_key
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", observation.source_kind, observation.native_id))
+}
+
+/// Derive facts and Unknowns from the observations given: the whole ledger,
+/// or whole cohorts of it.
 pub fn derive(observations: &[Observation], trust: &TrustFacts, as_of: &str) -> DerivedView {
     let mut builder = FactBuilder {
         trust,
@@ -3455,11 +3466,10 @@ pub fn derive(observations: &[Observation], trust: &TrustFacts, as_of: &str) -> 
         if observation.reducer_owned == Some(true) || observation.disposition == "CLOCK_SKEW" {
             continue;
         }
-        let key = observation
-            .logical_key
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", observation.source_kind, observation.native_id));
-        by_key.entry(key).or_default().push(observation);
+        by_key
+            .entry(derivation_key(observation))
+            .or_default()
+            .push(observation);
     }
     for (key, mut rows) in by_key {
         rows.sort_by(|a, b| {

@@ -253,6 +253,25 @@ impl PrivateStore {
                     id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, record TEXT NOT NULL, recorded_at TEXT NOT NULL);",
             )
             .map_err(sqlite_error("private schema"))?;
+        // A quarantined record is identified by what failed, not by when it
+        // was seen again: each re-ingest of the same bad record used to add a
+        // row. Rows from before this column have none and stay as they are.
+        let has_identity: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('quarantine') WHERE name = 'identity')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error("quarantine schema"))?;
+        if !has_identity {
+            self.connection
+                .execute_batch(
+                    "ALTER TABLE quarantine ADD COLUMN identity TEXT;
+                     CREATE UNIQUE INDEX IF NOT EXISTS quarantine_identity ON quarantine(identity);",
+                )
+                .map_err(sqlite_error("quarantine identity"))?;
+        }
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -514,6 +533,113 @@ impl PrivateStore {
         }
         skipped.report("observations");
         Ok(output)
+    }
+
+    /// The indexes `observations_in_cohorts` and `observation_count_for_kind`
+    /// read. Built on demand by ingest and the dream pass, never by the
+    /// shared schema: SessionStart opens this store, and building them over a
+    /// large ledger is not a hook's work.
+    pub fn ensure_cohort_indexes(&self) -> Result<(), ContractError> {
+        self.connection
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS observations_logical_key
+                     ON observations(json_extract(record, '$.logical_key'));
+                 CREATE INDEX IF NOT EXISTS observations_kind_native
+                     ON observations(source_kind, native_id);",
+            )
+            .map_err(sqlite_error("cohort indexes"))
+    }
+
+    /// The observations in the derivation cohorts `keys` name, in admission
+    /// order, as `all_observations` reads them. `lifecycle::derive` derives
+    /// each cohort (the observations sharing a logical key, or, with none,
+    /// the same `source_kind:native_id`) from its own rows alone, so a caller
+    /// that reports on a few observations derives their cohorts, not the
+    /// whole ledger: an ingest of one observation read every observation in
+    /// the store (0.9 s and 535 MB at 130,000).
+    pub fn observations_in_cohorts(
+        &self,
+        keys: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<Observation>, ContractError> {
+        self.ensure_cohort_indexes()?;
+        let mut by_logical = self
+            .connection
+            .prepare(
+                "SELECT rowid, record, lifecycle FROM observations
+                 WHERE json_extract(record, '$.logical_key') = ?1",
+            )
+            .map_err(sqlite_error("prepare"))?;
+        let mut by_native = self
+            .connection
+            .prepare(
+                "SELECT rowid, record, lifecycle FROM observations
+                 WHERE source_kind = ?1 AND native_id = ?2
+                   AND json_extract(record, '$.logical_key') IS NULL",
+            )
+            .map_err(sqlite_error("prepare"))?;
+        let read = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, String, String)> {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        };
+        let mut rows = std::collections::BTreeMap::new();
+        for key in keys {
+            for row in by_logical
+                .query_map(params![key], read)
+                .map_err(sqlite_error("query"))?
+            {
+                let (cursor, text, lifecycle) = row.map_err(sqlite_error("row"))?;
+                rows.insert(cursor, (text, lifecycle));
+            }
+            let Some((source_kind, native_id)) = key.split_once(':') else {
+                continue;
+            };
+            for row in by_native
+                .query_map(params![source_kind, native_id], read)
+                .map_err(sqlite_error("query"))?
+            {
+                let (cursor, text, lifecycle) = row.map_err(sqlite_error("row"))?;
+                rows.insert(cursor, (text, lifecycle));
+            }
+        }
+        let mut output = Vec::with_capacity(rows.len());
+        let mut skipped = crate::output::Skipped::default();
+        for (position, (cursor, (text, lifecycle))) in rows.into_iter().enumerate() {
+            let Ok(mut observation) = serde_json::from_str::<Observation>(&text) else {
+                skipped.push(
+                    position,
+                    text.len(),
+                    crate::output::unreadable_reason(text.as_bytes()),
+                );
+                continue;
+            };
+            observation.lifecycle = lifecycle;
+            observation.cursor = Some(cursor.max(0) as u64);
+            output.push(observation);
+        }
+        skipped.report("observations");
+        Ok(output)
+    }
+
+    /// How many observations an adapter has recorded.
+    pub fn observation_count_for_kind(&self, source_kind: &str) -> Result<usize, ContractError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE source_kind = ?1",
+                params![source_kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as usize)
+            .map_err(sqlite_error("count"))
+    }
+
+    /// Whether any observation is recorded under `source_identity`.
+    pub fn source_has_observations(&self, source_identity: &str) -> Result<bool, ContractError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM observations WHERE source_identity = ?1)",
+                params![source_identity],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sqlite_error("exists"))
     }
 
     /// The ledger's current admission cursor (highest rowid), 0 when empty.
@@ -1479,15 +1605,27 @@ impl PrivateStore {
     }
 
     pub fn quarantine(&self, kind: &str, record: &Value) -> Result<(), ContractError> {
+        // The identity leaves out when the record was quarantined (the proof
+        // clock, and the skew measured against it).
+        let mut identified = record.clone();
+        if let Some(fields) = identified.as_object_mut() {
+            fields.remove("proof_clock");
+            fields.remove("skew_seconds");
+        }
+        let identity = crate::hash::sha256_text(&format!(
+            "{kind}\0{}",
+            crate::output::single_line(&identified)
+        ));
         self.connection
             .execute(
-                "INSERT INTO quarantine(kind, record, recorded_at) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO quarantine(kind, record, recorded_at, identity) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     kind,
                     // Quarantine holds what failed the canonical rule, so it
                     // keeps an escaped rendering rather than refusing.
                     crate::output::single_line(record),
-                    crate::time::now_rfc3339_millis()
+                    crate::time::now_rfc3339_millis(),
+                    identity
                 ],
             )
             .map(|_| ())
@@ -1580,5 +1718,150 @@ mod sweep_tests {
         let (window, total) = store.recent_query_log(10).expect("window");
         assert_eq!(total, 3);
         assert_eq!(window.first(), Some(&json!({"query": "q2"})));
+    }
+}
+
+#[cfg(test)]
+mod cohort_tests {
+    use super::*;
+
+    fn observation(id: &str, kind: &str, native: &str, key: Option<&str>, at: &str) -> Observation {
+        Observation {
+            observation_id: id.to_owned(),
+            source_kind: kind.to_owned(),
+            source_identity: format!("source:{kind}"),
+            native_id: native.to_owned(),
+            content_digest: format!("digest-{id}"),
+            disposition: "current".to_owned(),
+            observed_at: at.to_owned(),
+            lifecycle: "observed".to_owned(),
+            logical_key: key.map(str::to_owned),
+            statement: Some(format!("statement {id}")),
+            atom_kind: Some("claim".to_owned()),
+            scope: Some("repository".to_owned()),
+            origin_trust: Some("merged-default".to_owned()),
+            ..Observation::default()
+        }
+    }
+
+    #[test]
+    fn a_cohort_derives_as_it_does_inside_the_whole_ledger() {
+        let store = PrivateStore::open_memory("personal").expect("store");
+        let rows = [
+            observation(
+                "obs_a1",
+                "docs_adr",
+                "a.md",
+                Some("doc:a"),
+                "2026-01-01T00:00:00.000Z",
+            ),
+            observation(
+                "obs_a2",
+                "docs_adr",
+                "a.md",
+                Some("doc:a"),
+                "2026-01-02T00:00:00.000Z",
+            ),
+            observation(
+                "obs_b",
+                "docs_adr",
+                "b.md",
+                Some("doc:b"),
+                "2026-01-01T00:00:00.000Z",
+            ),
+            // No logical key: its cohort is `kind:native`, which another
+            // observation also names as its logical key.
+            observation(
+                "obs_n",
+                "repo_tests",
+                "t1",
+                None,
+                "2026-01-01T00:00:00.000Z",
+            ),
+            observation(
+                "obs_k",
+                "repo_tests",
+                "t2",
+                Some("repo_tests:t1"),
+                "2026-01-03T00:00:00.000Z",
+            ),
+            observation(
+                "obs_c",
+                "repo_tests",
+                "t3",
+                None,
+                "2026-01-01T00:00:00.000Z",
+            ),
+        ];
+        for row in &rows {
+            assert!(store.insert_observation(row).expect("insert"));
+        }
+        let mut retired = rows[0].clone();
+        retired.lifecycle = "superseded".to_owned();
+        store.update_observation(&retired).expect("retire");
+
+        let trust = crate::lifecycle::TrustFacts::default();
+        let as_of = "2026-02-01T00:00:00.000Z";
+        let whole =
+            crate::lifecycle::derive(&store.all_observations().expect("all"), &trust, as_of);
+        let reported = ["obs_a2", "obs_n"];
+        let keys = rows
+            .iter()
+            .filter(|row| reported.contains(&row.observation_id.as_str()))
+            .map(crate::lifecycle::derivation_key)
+            .collect();
+        let cohort = store.observations_in_cohorts(&keys).expect("cohorts");
+        let ids: Vec<&str> = cohort
+            .iter()
+            .map(|row| row.observation_id.as_str())
+            .collect();
+        assert_eq!(ids, ["obs_a1", "obs_a2", "obs_n", "obs_k"]);
+        let part = crate::lifecycle::derive(&cohort, &trust, as_of);
+        for id in ids {
+            assert_eq!(
+                whole.observation_states.get(id),
+                part.observation_states.get(id),
+                "{id}"
+            );
+        }
+        let facts = |view: &crate::lifecycle::DerivedView| {
+            view.facts
+                .iter()
+                .filter(|fact| {
+                    fact.evidence_refs
+                        .iter()
+                        .any(|id| reported.contains(&id.as_str()))
+                })
+                .map(|fact| serde_json::to_value(fact).expect("fact"))
+                .collect::<Vec<_>>()
+        };
+        assert!(!facts(&whole).is_empty());
+        assert_eq!(facts(&whole), facts(&part));
+        assert_eq!(
+            store
+                .observation_count_for_kind("repo_tests")
+                .expect("count"),
+            3
+        );
+    }
+
+    #[test]
+    fn the_same_bad_record_is_quarantined_once() {
+        let store = PrivateStore::open_memory("personal").expect("store");
+        for clock in ["2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z"] {
+            store
+                .quarantine(
+                    "CLOCK_SKEW",
+                    &serde_json::json!({"native_id": "n1", "proof_clock": clock, "skew_seconds": 9}),
+                )
+                .expect("quarantine");
+        }
+        store
+            .quarantine(
+                "CLOCK_SKEW",
+                &serde_json::json!({"native_id": "n2", "proof_clock": "x"}),
+            )
+            .expect("quarantine");
+        assert_eq!(store.quarantine_count("CLOCK_SKEW").expect("count"), 2);
     }
 }

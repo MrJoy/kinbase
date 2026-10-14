@@ -100,8 +100,14 @@ pub fn dream(root: &Path, force: bool) -> Result<Value, ContractError> {
         report["ledger"] = json!(name);
         ledgers.push(report);
     }
+    // The indexes ingest derives through, built here rather than by the first
+    // ingest after an upgrade.
+    let cohort_indexes = crate::private::PrivateStore::open_personal(root)
+        .and_then(|store| store.ensure_cohort_indexes())
+        .map_or_else(|error| json!(error.code), |()| json!("ready"));
     let result = json!({
         "status": "dreamed",
+        "cohort_indexes": cohort_indexes,
         "finished_at": crate::time::now_rfc3339_millis(),
         "milliseconds": started.elapsed().as_millis() as u64,
         "ledgers": ledgers,

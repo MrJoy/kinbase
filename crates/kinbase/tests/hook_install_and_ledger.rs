@@ -428,10 +428,9 @@ fn dispatch_accepts_host_envelopes_with_control_characters_and_floats() {
     let receipt: Value = serde_json::from_slice(&output.stdout).expect("Stop receipt");
     assert_eq!(receipt["checkpointed"], true, "{receipt}");
     assert_eq!(receipt["session_id"], "host-session-1");
-    let ledger = fs::read_to_string(world.personal.join("session-checkpoints.jsonl"))
-        .expect("checkpoint ledger written");
-    assert_eq!(ledger.lines().count(), 1);
-    assert!(ledger.contains("\"session_id\":\"host-session-1\""));
+    // Nothing was decided, so nothing is recorded.
+    assert_eq!(receipt["checkpoint_recorded"], false, "{receipt}");
+    assert!(!world.personal.join("session-checkpoints.jsonl").exists());
 
     // PreToolUse: a multi-line shell command, then an MCP tool whose input
     // carries a float and multi-line prose, as the host sends each of them.
@@ -878,6 +877,31 @@ fn session_end_does_not_read_the_checkpoint_ledger() {
         ledger.write_at(b"\n", size - 1).expect("terminate ledger");
     }
     drop(ledger);
+    // A candidate for the checkpoint to decide, so it has a record to append
+    // to a ledger far too large for a hook to read or index.
+    let canonical = kinbase::json::canonical_text(&json!({
+        "destination": "personal",
+        "atom_kind": "constraint",
+        "scope": "host-session",
+        "statement": "Retries stop after five attempts."
+    }));
+    fs::write(
+        world.personal.join("candidates.jsonl"),
+        format!(
+            "{}\n",
+            kinbase::json::canonical_text(&json!({
+                "candidate_id": "cand_end",
+                "session_id": "host-session-end",
+                "admission_mode": "automatic",
+                "destination": "personal",
+                "principal": "principal-a",
+                "canonical": canonical,
+                "payload_digest": kinbase::hash::sha256_text(&canonical),
+                "confidence": 8000
+            }))
+        ),
+    )
+    .expect("candidates");
     let envelope = json!({
         "session_id": "host-session-end",
         "hook_event_name": "SessionEnd",

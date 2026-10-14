@@ -2165,9 +2165,29 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
             personal_fact_count += 1;
         }
     }
+    let decided = admissions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !settled.contains(index))
+        .map(|(_, row)| row.clone())
+        .collect::<Vec<_>>();
+    // A checkpoint is identified by what it decided, never by when it ran:
+    // the same admissions, holds, failures, facts and sweep in the same
+    // session are the same checkpoint. The counters beside them
+    // (observations, atoms, pending, settled) are derived from the ledgers
+    // and are not part of it.
+    let decision = checkpoint_decision(&json!({
+        "session_id": session,
+        "admissions": decided,
+        "admission_failures": admission_failures,
+        "admissions_held": admissions_held,
+        "personal_fact_count": personal_fact_count,
+        "sweep": sweep
+    }));
+    let checkpoint_id = checkpoint_id(&decision);
     let record = json!({
         "session_id": session,
-        "checkpoint_id": format!("checkpoint_{}", Uuid::new_v4()),
+        "checkpoint_id": checkpoint_id,
         "status": "checkpointed",
         "checkpointed": true,
         "checkpointed_at": now,
@@ -2176,26 +2196,61 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
         "atom_count": atoms.len(),
         "personal_fact_count": personal_fact_count,
         "sweep": sweep,
-        "admissions": admissions
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !settled.contains(index))
-            .map(|(_, row)| row)
-            .collect::<Vec<_>>(),
+        "admissions": decided,
         "admission_failures": admission_failures,
         "admissions_held": admissions_held,
         "admissions_settled": settled.len()
     });
-    // The record carries a fresh checkpoint id, so it is never already there.
-    crate::store::append_fresh_record(
-        crate::StoreKind::Personal,
-        &repo,
-        "session-checkpoints.jsonl",
-        &record,
-    )?;
+    // A checkpoint that decided nothing carries only counters the ledgers
+    // already hold: it is not recorded. One that decided what an earlier one
+    // did (the same candidates held again) is the same checkpoint, and the
+    // identity-keyed append does not record it twice.
+    let recorded = !checkpoint_is_empty(&decision);
+    if recorded {
+        append_personal("session-checkpoints.jsonl", &record)?;
+    }
     let mut response = record;
     response["admissions"] = Value::Array(admissions);
+    response["checkpoint_recorded"] = Value::Bool(recorded);
     Ok((response, first_failure))
+}
+
+/// The part of a checkpoint record that is its identity: what it decided.
+pub(crate) fn checkpoint_decision(record: &Value) -> Value {
+    json!({
+        "session_id": record.get("session_id").cloned().unwrap_or(Value::Null),
+        "admissions": record.get("admissions").cloned().unwrap_or_else(|| json!([])),
+        "admission_failures": record.get("admission_failures").cloned().unwrap_or_else(|| json!(0)),
+        "admissions_held": record.get("admissions_held").cloned().unwrap_or_else(|| json!(0)),
+        "personal_fact_count": record.get("personal_fact_count").cloned().unwrap_or_else(|| json!(0)),
+        "sweep": record.get("sweep").cloned().unwrap_or(Value::Null)
+    })
+}
+
+/// A checkpoint's id: the digest of what it decided.
+pub(crate) fn checkpoint_id(decision: &Value) -> String {
+    format!(
+        "checkpoint_{}",
+        sha256_text(&crate::json::jcs_text(decision))
+    )
+}
+
+/// Whether a receipt settles its candidate's admission (`receipt_settled`).
+pub(crate) fn admission_settled(receipt: &Value) -> bool {
+    receipt_settled(receipt)
+}
+
+/// Whether a checkpoint's decision part decided nothing: no admission, hold
+/// or failure, no Personal fact and no swept state.
+pub(crate) fn checkpoint_is_empty(decision: &Value) -> bool {
+    let zero = |value: &Value| value.as_u64() == Some(0);
+    decision["admissions"].as_array().is_some_and(Vec::is_empty)
+        && zero(&decision["admission_failures"])
+        && zero(&decision["admissions_held"])
+        && zero(&decision["personal_fact_count"])
+        && decision["sweep"]
+            .as_object()
+            .is_none_or(|sweep| sweep.values().all(zero))
 }
 
 /// One candidate's failed admission, as its checkpoint row: the candidate,

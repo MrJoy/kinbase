@@ -19,6 +19,7 @@ pub mod company;
 pub mod config;
 pub mod corpus;
 pub mod crypto;
+pub mod dream;
 pub mod error;
 pub mod hash;
 pub mod hooks;

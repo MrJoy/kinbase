@@ -44,6 +44,11 @@ const INDEX_FILE: &str = ".ledger-index.sqlite3";
 /// under another version is rebuilt rather than trusted.
 const INDEX_VERSION: i64 = 2;
 const TAIL_BYTES: u64 = 64;
+/// The most of a ledger a hook-path call reads to bring the index up to
+/// date. Further behind than this (the first run over an existing store, a
+/// rewrite of a large ledger), the call does without the index and the dream
+/// pass (`refresh`) catches it up off the hook path.
+const HOOK_CATCH_UP_BYTES: u64 = 64 << 20;
 
 /// What identifies a ledger's records and what readers look them up by.
 pub struct Spec {
@@ -76,6 +81,13 @@ const SPECS: &[(&str, Spec)] = &[
         },
     ),
     (
+        "session-checkpoints.jsonl",
+        Spec {
+            key: &["checkpoint_id"],
+            tags: &["session_id"],
+        },
+    ),
+    (
         "candidates.jsonl",
         Spec {
             key: &["candidate_id"],
@@ -100,7 +112,7 @@ fn sqlite_error(context: &str) -> impl Fn(rusqlite::Error) -> ContractError + '_
 /// The identity of `record`: its key fields' values. A record missing a key
 /// field (or holding a non-string there) is identified by its whole line, the
 /// only identity it has.
-fn identity(spec: &Spec, record: &Map<String, Value>, line: &[u8]) -> [u8; 32] {
+pub(crate) fn identity(spec: &Spec, record: &Map<String, Value>, line: &[u8]) -> [u8; 32] {
     let mut text = String::from("key");
     for field in spec.key {
         match record.get(*field) {
@@ -314,7 +326,8 @@ fn rebuild(
     ledger: &str,
     spec: &Spec,
     file: &fs::File,
-) -> Result<(), ContractError> {
+    budget: Option<u64>,
+) -> Result<bool, ContractError> {
     for table in ["keys", "tags", "cursor"] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE ledger = ?1"),
@@ -330,7 +343,7 @@ fn rebuild(
             "effect": "the ledger is indexed again from the start"
         }),
     );
-    catch_up(tx, ledger, spec, file)
+    catch_up(tx, ledger, spec, file, budget)
 }
 
 fn set_cursor(
@@ -367,7 +380,8 @@ fn catch_up(
     ledger: &str,
     spec: &Spec,
     file: &fs::File,
-) -> Result<(), ContractError> {
+    budget: Option<u64>,
+) -> Result<bool, ContractError> {
     let metadata = file
         .metadata()
         .map_err(|error| ContractError::io("inspect ledger", error))?;
@@ -396,7 +410,7 @@ fn catch_up(
             .then_some(length as u64)
     });
     let start = match current {
-        Some(length) if length == metadata.len() => return Ok(()),
+        Some(length) if length == metadata.len() => return Ok(true),
         Some(length) => length,
         None => {
             for table in ["keys", "tags"] {
@@ -409,6 +423,9 @@ fn catch_up(
             0
         }
     };
+    if budget.is_some_and(|budget| metadata.len() - start > budget) {
+        return Ok(false);
+    }
     let mut reader = std::io::BufReader::new(file);
     reader
         .seek(std::io::SeekFrom::Start(start))
@@ -438,7 +455,8 @@ fn catch_up(
         }
         offset += read as u64;
     }
-    set_cursor(tx, ledger, file, offset)
+    set_cursor(tx, ledger, file, offset)?;
+    Ok(true)
 }
 
 /// What `append` did with a record.
@@ -447,6 +465,9 @@ pub enum Appended {
     Present,
     /// The record was written.
     Written,
+    /// The index is too far behind the ledger to answer within a hook's
+    /// budget; nothing was written.
+    Behind,
 }
 
 /// Append `canonical` to the ledger open (and exclusively locked) as `file`
@@ -469,7 +490,9 @@ pub fn append(
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error("begin"))?;
-    catch_up(&tx, &ledger, spec, file)?;
+    if !catch_up(&tx, &ledger, spec, file, Some(HOOK_CATCH_UP_BYTES))? {
+        return Ok(Appended::Behind);
+    }
     let key = identity(spec, &record, canonical.as_bytes());
     let lookup = || {
         tx.query_row(
@@ -490,7 +513,10 @@ pub fn append(
     };
     let mut present = lookup()?;
     if present.is_some_and(|span| !confirmed(span)) {
-        rebuild(&tx, &ledger, spec, file)?;
+        if !rebuild(&tx, &ledger, spec, file, Some(HOOK_CATCH_UP_BYTES))? {
+            tx.commit().map_err(sqlite_error("commit"))?;
+            return Ok(Appended::Behind);
+        }
         present = lookup()?.filter(|span| confirmed(*span));
     }
     if present.is_some() {
@@ -515,7 +541,8 @@ pub fn append(
 }
 
 /// The lines of the ledger at `path` tagged `field` = one of `values`, in
-/// ledger order. `None` when the ledger is not indexed by `field`.
+/// ledger order. `None` when the ledger is not indexed by `field`, or the
+/// index is too far behind to answer within a hook's budget.
 pub fn read_tagged(
     path: &Path,
     field: &str,
@@ -541,7 +568,10 @@ pub fn read_tagged(
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error("begin"))?;
-    catch_up(&tx, &ledger, spec, &file)?;
+    if !catch_up(&tx, &ledger, spec, &file, Some(HOOK_CATCH_UP_BYTES))? {
+        behind(&ledger);
+        return Ok(None);
+    }
     // Each line the index names is read back and kept only if the ledger
     // holds it whole there with the tag; one that is not rebuilds the index.
     let tagged = || -> Result<Option<Vec<Vec<u8>>>, ContractError> {
@@ -573,7 +603,11 @@ pub fn read_tagged(
     let lines = match tagged()? {
         Some(lines) => lines,
         None => {
-            rebuild(&tx, &ledger, spec, &file)?;
+            if !rebuild(&tx, &ledger, spec, &file, Some(HOOK_CATCH_UP_BYTES))? {
+                tx.commit().map_err(sqlite_error("commit"))?;
+                behind(&ledger);
+                return Ok(None);
+            }
             tagged()?.ok_or_else(|| {
                 ContractError::internal("ledger index disagrees with a ledger it just read")
             })?
@@ -581,6 +615,43 @@ pub fn read_tagged(
     };
     tx.commit().map_err(sqlite_error("commit"))?;
     Ok(Some(lines))
+}
+
+/// The index is too far behind the ledger for a hook to catch it up.
+pub fn behind(ledger: &str) {
+    crate::output::diagnostic(
+        "ledger-index-behind",
+        serde_json::json!({
+            "ledger": ledger,
+            "effect": "answered without the index; the dream pass indexes the ledger"
+        }),
+    );
+}
+
+/// Bring the index of the ledger at `path` fully up to date, however far
+/// behind it is. Off the hook path: the dream pass, after it compacts.
+pub fn refresh(path: &Path) -> Result<(), ContractError> {
+    let Some(spec) = spec_for(path) else {
+        return Ok(());
+    };
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ContractError::io("open ledger", error)),
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(ContractError::io(
+            "lock ledger",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let ledger = ledger_name(path);
+    let mut connection = open(path)?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error("begin"))?;
+    catch_up(&tx, &ledger, spec, &file, None)?;
+    tx.commit().map_err(sqlite_error("commit"))
 }
 
 /// The index could not answer; the caller falls back to the ledger itself.

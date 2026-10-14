@@ -92,6 +92,19 @@ fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
             let as_of = resolve_as_of(&launcher, &repo, as_of.as_deref())?;
             crate::repository::status(launcher, &repo, &as_of, json).map_err(internal)?;
         }
+        Command::Dream { force } => {
+            let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let root = crate::store::ensure_store_root(crate::StoreKind::Personal, &repo)?;
+            let result = crate::dream::dream(&root, force)?;
+            if json {
+                println!("{}", crate::json::canonical_text(&result));
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            }
+        }
         Command::Doctor { host, repo } => {
             let repo = repo
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));

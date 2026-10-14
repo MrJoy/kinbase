@@ -14,6 +14,26 @@ Notable changes to Kinbase. Dates are UTC.
   output is printed. Off unless configured; a repository's config cannot set or
   weaken it. See README, "Masking known secrets".
 
+- `kinbase dream`: the Personal store's maintenance, off the hook path. It
+  compacts `observations`, `session-events`, `atoms`, `candidates` and
+  `session-checkpoints` by identity (the first copy stands; an unreadable line is
+  kept as it is), puts old checkpoints in the current form (receipts settled by an
+  earlier checkpoint of the session are counted, not listed again; checkpoints
+  that decided nothing are dropped), swaps each compacted ledger in under its lock
+  and brings the ledger index fully up to date. Each replaced ledger is kept as
+  `<ledger>.pre-dream-<unix seconds>` for a week. SessionEnd starts a detached
+  dream at most once a day; `--force` runs one now. On a copy of a 1.6 GB store
+  the first dream took 4.5 s: checkpoints 803 MB to 8.5 MB, observations 276 MB to
+  175 MB, every identity and receipt kept.
+
+### Changed
+
+- A checkpoint that decided nothing (no admission, hold, failure, Personal fact
+  or swept state) is no longer recorded; its counters are already in the ledgers.
+  A checkpoint's id is now the digest of what it decided, so one that decided what
+  an earlier one did (the same candidates held again) is recorded once. The hook
+  response is unchanged apart from `checkpoint_recorded`.
+
 ### Fixed
 
 - Stop, SessionEnd and PreCompact no longer slow down as the Personal store grows.
@@ -33,5 +53,10 @@ Notable changes to Kinbase. Dates are UTC.
   it last looked, and is rebuilt from the ledger when missing, stale or of another
   version. On a copy of a 1.6 GB Personal store, a Stop or SessionEnd with nothing
   to do went from 0.16 s to 0.02 s, a Stop in a 3,548-candidate session from 0.41 s
-  to 0.29 s, and the per-prompt observe worker from 0.71 s to 0.15 s. The first run
-  builds the index once (1.6 s on that store).
+  to 0.29 s, and the per-prompt observe worker from 0.71 s to 0.15 s. A hook reads
+  at most 64 MiB of ledger to bring the index up to date; further behind (the
+  first run over an existing store), it does without the index and the dream pass
+  indexes the ledger.
+- Masking known secrets no longer asks every value whether it occurs in every
+  string: a prefilter on the values' leading bytes passes over text that holds
+  none. A Stop masking a 3,548-candidate response went from 0.29 s to 0.22 s.

@@ -681,12 +681,14 @@ fn a_later_stop_counts_an_admitted_candidate_instead_of_admitting_it_again() {
         decisions,
         "nothing is decided twice"
     );
+    // The second Stop decided nothing: it is not recorded.
+    assert_eq!(first["checkpoint_recorded"], true, "{first}");
+    assert_eq!(second["checkpoint_recorded"], false, "{second}");
     let checkpoints =
         fs::read_to_string(world.personal.join("session-checkpoints.jsonl")).expect("checkpoints");
     let lines: Vec<&str> = checkpoints.lines().collect();
-    assert_eq!(lines.len(), 2, "{checkpoints}");
+    assert_eq!(lines.len(), 1, "{checkpoints}");
     assert!(lines[0].contains("\"candidate_id\":\"cand_c\""));
-    assert!(!lines[1].contains("cand_c"), "{}", lines[1]);
 }
 
 #[test]
@@ -707,7 +709,8 @@ fn a_precompact_checkpoints_the_session_and_allows_the_compaction() {
     ));
     assert_eq!(receipt["compact_allowed"], true, "{receipt}");
     assert_eq!(receipt["checkpointed"], true, "{receipt}");
-    let ledger = fs::read_to_string(world.personal.join("session-checkpoints.jsonl"))
-        .expect("the checkpoint is written");
-    assert!(ledger.contains("\"session_id\":\"host-session-compact\""));
+    // A checkpoint that decided nothing carries only counters the ledgers
+    // already hold, so it is not recorded.
+    assert_eq!(receipt["checkpoint_recorded"], false, "{receipt}");
+    assert!(!world.personal.join("session-checkpoints.jsonl").exists());
 }

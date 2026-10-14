@@ -607,7 +607,9 @@ fn a_later_stop_counts_an_admitted_candidate_instead_of_admitting_it_again() {
         .expect("the admission is decided");
 
     let second = dispatch();
-    assert_eq!(second["admissions"], json!([]), "{second}");
+    // The host still recovers the session's receipts from its Stop (V-9
+    // parity): the settled receipt is returned unchanged, only not recorded.
+    assert_eq!(second["admissions"], first["admissions"], "{second}");
     assert_eq!(second["admissions_settled"], 1, "{second}");
     assert_eq!(second["admission_failures"], 0, "{second}");
     assert_eq!(second["checkpointed"], true, "{second}");
@@ -616,8 +618,8 @@ fn a_later_stop_counts_an_admitted_candidate_instead_of_admitting_it_again() {
         decisions,
         "nothing is decided twice"
     );
-    let checkpoints = fs::read_to_string(world.personal.join("session-checkpoints.jsonl"))
-        .expect("checkpoints");
+    let checkpoints =
+        fs::read_to_string(world.personal.join("session-checkpoints.jsonl")).expect("checkpoints");
     let lines: Vec<&str> = checkpoints.lines().collect();
     assert_eq!(lines.len(), 2, "{checkpoints}");
     assert!(lines[0].contains("\"candidate_id\":\"cand_c\""));

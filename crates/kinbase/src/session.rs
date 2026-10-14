@@ -2011,15 +2011,17 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
     let mut admissions = Vec::new();
     let mut admission_failures = 0usize;
     let mut admissions_held = 0usize;
-    // A candidate whose exact bytes already have a settled receipt is counted,
-    // not admitted again and listed: every Stop re-listed every receipt the
-    // session had ever earned, so a checkpoint grew with the session (1.3 MB
-    // at 2,774 candidates) and the ledger with its square (808 MB from one
-    // session).
-    let mut admissions_settled = 0usize;
+    // A candidate whose exact bytes already have a settled receipt is not
+    // admitted again. Its receipt is still returned, since a host's Stop
+    // recovers the session's receipts from it (V-9 parity), but the recorded
+    // checkpoint only counts it: every recorded checkpoint used to re-list
+    // every receipt the session had ever earned, so it grew with the session
+    // (1.3 MB at 2,774 candidates) and the ledger with its square (808 MB
+    // from one session).
+    let mut settled = BTreeSet::new();
     let mut first_failure: Option<ContractError> = None;
+    let repo = std::env::current_dir().map_err(io_error)?;
     if !candidates.is_empty() {
-        let repo = std::env::current_dir().map_err(io_error)?;
         let launcher = crate::launcher::Launcher::load();
         let latest = latest_receipts(&candidates.keys().map(String::as_str).collect());
         let mut decisions_synced = false;
@@ -2027,9 +2029,9 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
             let admitted = (|| {
                 let digest = candidate_digest(candidate)?;
                 let latest = latest.as_ref().map_err(Clone::clone)?;
-                if candidate_key(candidate, &digest)
+                if let Some(previous) = candidate_key(candidate, &digest)
                     .and_then(|key| latest.get(&key))
-                    .is_some_and(receipt_settled)
+                    .filter(|receipt| receipt_settled(receipt))
                 {
                     // Acting on a found receipt: make sure it is on disk
                     // first, once for the whole checkpoint.
@@ -2041,16 +2043,19 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
                         )?;
                         decisions_synced = true;
                     }
-                    return Ok(None);
+                    return Ok(Err(previous.clone()));
                 }
                 match &launcher {
-                    Ok(launcher) => admit_unsettled(launcher, &repo, candidate, &digest).map(Some),
+                    Ok(launcher) => admit_unsettled(launcher, &repo, candidate, &digest).map(Ok),
                     Err(error) => Err(error.clone()),
                 }
             })();
             match admitted {
-                Ok(None) => admissions_settled += 1,
-                Ok(Some(receipt)) => admissions.push(receipt),
+                Ok(Err(previous)) => {
+                    settled.insert(admissions.len());
+                    admissions.push(previous);
+                }
+                Ok(Ok(receipt)) => admissions.push(receipt),
                 Err(error) if error.code == "REPO_UNCERTIFIED" => {
                     // Not a failure: this host simply has nowhere to put a
                     // shared candidate yet. Holding it says so once and keeps
@@ -2162,20 +2167,26 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
         "atom_count": atoms.len(),
         "personal_fact_count": personal_fact_count,
         "sweep": sweep,
-        "admissions": admissions,
+        "admissions": admissions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !settled.contains(index))
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>(),
         "admission_failures": admission_failures,
         "admissions_held": admissions_held,
-        "admissions_settled": admissions_settled
+        "admissions_settled": settled.len()
     });
     // The record carries a fresh checkpoint id, so it is never already there.
-    let repo = std::env::current_dir().map_err(io_error)?;
     crate::store::append_fresh_record(
         crate::StoreKind::Personal,
         &repo,
         "session-checkpoints.jsonl",
         &record,
     )?;
-    Ok((record, first_failure))
+    let mut response = record;
+    response["admissions"] = Value::Array(admissions);
+    Ok((response, first_failure))
 }
 
 /// One candidate's failed admission, as its checkpoint row: the candidate,
@@ -4390,19 +4401,15 @@ fn admit_candidate(
     // ledger once for all of them instead (`latest_receipts`).
     let receipts =
         personal_records_complete_marked("proposal-decisions.jsonl", &value_marker(candidate))?;
-    let key = candidate_key(record, &digest);
-    if let Some(previous) = receipts
-        .into_iter()
-        .rev()
-        .find(|receipt| key.is_some() && receipt_key(receipt) == key)
+    if let Some(key) = candidate_key(record, &digest)
+        && let Some(previous) = receipts
+            .into_iter()
+            .rev()
+            .find(|receipt| receipt_key(receipt).as_ref() == Some(&key))
         && receipt_settled(&previous)
     {
         // Acting on a found receipt: make sure it is on disk first.
-        crate::store::sync_record(
-            crate::StoreKind::Personal,
-            &std::env::current_dir().map_err(io_error)?,
-            "proposal-decisions.jsonl",
-        )?;
+        crate::store::sync_record(crate::StoreKind::Personal, repo, "proposal-decisions.jsonl")?;
         return Ok(previous);
     }
     admit_unsettled(launcher, repo, record, &digest)
@@ -4508,8 +4515,7 @@ fn admit_unsettled(
 ) -> Result<Value, ContractError> {
     let candidate = crate::json::get_str(record, "candidate_id").unwrap_or_default();
     let destination = crate::json::get_str(record, "destination").unwrap_or_default();
-    let digest = digest.to_owned();
-    let receipt_id = receipt_id(candidate, destination, &digest);
+    let receipt_id = receipt_id(candidate, destination, digest);
     let receipt = json!({
         "candidate_id": candidate,
         "destination": destination,
@@ -4533,7 +4539,7 @@ fn admit_unsettled(
                 repo,
                 record,
                 destination,
-                &digest,
+                digest,
                 &receipt_id,
                 &receipt,
             )?;

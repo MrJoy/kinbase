@@ -57,6 +57,15 @@ Notable changes to Kinbase. Dates are UTC.
   at most 64 MiB of ledger to bring the index up to date; further behind (the
   first run over an existing store), it does without the index and the dream pass
   indexes the ledger.
+- Ingest no longer reads the whole Personal store on every run. It derives only
+  the cohorts of the observations it reports (those sharing a logical key, or
+  `source_kind:native_id`), which `derive` already derived from their own rows
+  alone; counts an adapter's receipts in SQL; and looks for rows under a source's
+  older identities before reading anything to adopt them. A re-ingest at 130,000
+  observations went from 0.90 s and 532 MB to 0.03 s and 12 MB, with the same
+  receipt. The two indexes this reads are built by the first ingest or dream, not
+  by a hook. A quarantined record is identified by what failed, not when: the same
+  bad record re-ingested is quarantined once.
 - Masking known secrets no longer asks every value whether it occurs in every
   string: a prefilter on the values' leading bytes passes over text that holds
   none. A Stop masking a 3,548-candidate response went from 0.29 s to 0.22 s.

@@ -2011,17 +2011,53 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
     let mut admissions = Vec::new();
     let mut admission_failures = 0usize;
     let mut admissions_held = 0usize;
+    // A candidate whose exact bytes already have a settled receipt is not
+    // admitted again. Its receipt is still returned, since a host's Stop
+    // recovers the session's receipts from it (V-9 parity), but the recorded
+    // checkpoint only counts it: every recorded checkpoint used to re-list
+    // every receipt the session had ever earned, so it grew with the session
+    // (1.3 MB at 2,774 candidates) and the ledger with its square (808 MB
+    // from one session).
+    let mut settled = BTreeSet::new();
     let mut first_failure: Option<ContractError> = None;
+    let repo = std::env::current_dir().map_err(io_error)?;
     if !candidates.is_empty() {
-        let repo = std::env::current_dir().map_err(io_error)?;
         let launcher = crate::launcher::Launcher::load();
+        let latest = latest_receipts(&candidates.keys().map(String::as_str).collect());
+        let mut decisions_synced = false;
         for candidate in candidates.values() {
-            let admitted = match &launcher {
-                Ok(launcher) => admit_candidate(launcher, &repo, candidate),
-                Err(error) => Err(error.clone()),
-            };
+            let admitted = (|| {
+                let digest = candidate_digest(candidate)?;
+                let latest = latest.as_ref().map_err(Clone::clone)?;
+                if let Some(previous) = candidate_key(candidate, &digest)
+                    .and_then(|key| latest.get(&key))
+                    .filter(|receipt| receipt_settled(receipt))
+                {
+                    // Acting on a found receipt: make sure it is on disk
+                    // first, once for the whole checkpoint.
+                    if !decisions_synced {
+                        crate::store::sync_record(
+                            crate::StoreKind::Personal,
+                            &repo,
+                            "proposal-decisions.jsonl",
+                        )?;
+                        decisions_synced = true;
+                    }
+                    return Ok(Admission::Settled(previous.clone()));
+                }
+                match &launcher {
+                    Ok(launcher) => {
+                        admit_unsettled(launcher, &repo, candidate, &digest).map(Admission::Decided)
+                    }
+                    Err(error) => Err(error.clone()),
+                }
+            })();
             match admitted {
-                Ok(receipt) => admissions.push(receipt),
+                Ok(Admission::Settled(previous)) => {
+                    settled.insert(admissions.len());
+                    admissions.push(previous);
+                }
+                Ok(Admission::Decided(receipt)) => admissions.push(receipt),
                 Err(error) if error.code == "REPO_UNCERTIFIED" => {
                     // Not a failure: this host simply has nowhere to put a
                     // shared candidate yet. Holding it says so once and keeps
@@ -2133,12 +2169,26 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
         "atom_count": atoms.len(),
         "personal_fact_count": personal_fact_count,
         "sweep": sweep,
-        "admissions": admissions,
+        "admissions": admissions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !settled.contains(index))
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>(),
         "admission_failures": admission_failures,
-        "admissions_held": admissions_held
+        "admissions_held": admissions_held,
+        "admissions_settled": settled.len()
     });
-    append_personal("session-checkpoints.jsonl", &record)?;
-    Ok((record, first_failure))
+    // The record carries a fresh checkpoint id, so it is never already there.
+    crate::store::append_fresh_record(
+        crate::StoreKind::Personal,
+        &repo,
+        "session-checkpoints.jsonl",
+        &record,
+    )?;
+    let mut response = record;
+    response["admissions"] = Value::Array(admissions);
+    Ok((response, first_failure))
 }
 
 /// One candidate's failed admission, as its checkpoint row: the candidate,
@@ -4347,7 +4397,29 @@ fn admit_candidate(
     record: &Value,
 ) -> Result<Value, ContractError> {
     let candidate = crate::json::get_str(record, "candidate_id").unwrap_or_default();
-    let destination = crate::json::get_str(record, "destination").unwrap_or_default();
+    let digest = candidate_digest(record)?;
+    // Reads only this candidate's receipts rather than the whole decision
+    // ledger. A checkpoint, which admits many candidates at once, reads the
+    // ledger once for all of them instead (`latest_receipts`).
+    let receipts =
+        personal_records_complete_marked("proposal-decisions.jsonl", &value_marker(candidate))?;
+    if let Some(key) = candidate_key(record, &digest)
+        && let Some(previous) = receipts
+            .into_iter()
+            .rev()
+            .find(|receipt| receipt_key(receipt).as_ref() == Some(&key))
+        && receipt_settled(&previous)
+    {
+        // Acting on a found receipt: make sure it is on disk first.
+        crate::store::sync_record(crate::StoreKind::Personal, repo, "proposal-decisions.jsonl")?;
+        return Ok(previous);
+    }
+    admit_unsettled(launcher, repo, record, &digest)
+}
+
+/// The content address of a candidate's bytes, refused when it differs from
+/// the one the candidate carries.
+fn candidate_digest(record: &Value) -> Result<String, ContractError> {
     let canonical = crate::json::get_str(record, "canonical").unwrap_or_default();
     let digest = sha256_text(canonical);
     if crate::json::get_str(record, "payload_digest") != Some(digest.as_str()) {
@@ -4357,28 +4429,111 @@ fn admit_candidate(
             "Preserve the candidate and inspect its source.",
         ));
     }
-    // The Stop path admits every automatic candidate; each reads only its
-    // own receipts rather than the whole decision ledger.
-    if let Some(previous) =
-        personal_records_complete_marked("proposal-decisions.jsonl", &value_marker(candidate))?
-            .into_iter()
-            .rev()
-            .find(|receipt| {
-                crate::json::get_str(receipt, "candidate_id") == Some(candidate)
-                    && crate::json::get_str(receipt, "destination") == Some(destination)
-                    && crate::json::get_str(receipt, "digest") == Some(digest.as_str())
-            })
-        && matches!(decision_state(&previous), "committed" | "refused")
-    {
-        // Acting on a found receipt: make sure it is on disk first.
-        crate::store::sync_record(
-            crate::StoreKind::Personal,
-            &std::env::current_dir().map_err(io_error)?,
-            "proposal-decisions.jsonl",
-        )?;
-        return Ok(previous);
+    Ok(digest)
+}
+
+/// What a checkpoint got for one candidate. A settled receipt is returned to
+/// the host but only counted in the recorded checkpoint, so the two cases
+/// have to stay apart until the record is written.
+enum Admission {
+    /// A receipt an earlier admission of the same bytes settled.
+    Settled(Value),
+    /// The receipt this checkpoint's admission produced.
+    Decided(Value),
+}
+
+/// What a receipt decides: one candidate's exact bytes for one destination.
+type ReceiptKey = (String, String, String);
+
+fn candidate_key(record: &Value, digest: &str) -> Option<ReceiptKey> {
+    Some((
+        crate::json::get_str(record, "candidate_id")?.to_owned(),
+        crate::json::get_str(record, "destination")?.to_owned(),
+        digest.to_owned(),
+    ))
+}
+
+fn receipt_key(receipt: &Value) -> Option<ReceiptKey> {
+    Some((
+        crate::json::get_str(receipt, "candidate_id")?.to_owned(),
+        crate::json::get_str(receipt, "destination")?.to_owned(),
+        crate::json::get_str(receipt, "digest")?.to_owned(),
+    ))
+}
+
+/// A receipt that ends its candidate's admission: admitting the same bytes
+/// again would only return it.
+fn receipt_settled(receipt: &Value) -> bool {
+    matches!(decision_state(receipt), "committed" | "refused")
+}
+
+/// The last receipt for each of `candidates`, from one streamed read of the
+/// decision ledger. Looking each candidate's receipts up on its own read the
+/// whole ledger once per candidate: a Stop in a session with 2,774
+/// candidates read 6 MB 2,774 times and took 28 s.
+fn latest_receipts(
+    candidates: &BTreeSet<&str>,
+) -> Result<std::collections::HashMap<ReceiptKey, Value>, ContractError> {
+    let mut latest = std::collections::HashMap::new();
+    if candidates.is_empty() {
+        return Ok(latest);
     }
-    let receipt_id = receipt_id(candidate, destination, &digest);
+    // Lines are kept by the value, as the reader asks: each JSON string on
+    // the line, spelled as the canonical writer spells it, is looked up in
+    // the set, rather than every id searched for in every line. The exact
+    // filter on the parsed receipt below still decides.
+    let markers: std::collections::HashSet<String> =
+        candidates.iter().map(|id| value_marker(id)).collect();
+    let repo = std::env::current_dir().map_err(io_error)?;
+    let receipts = crate::store::read_records_complete_where(
+        crate::StoreKind::Personal,
+        &repo,
+        "proposal-decisions.jsonl",
+        |line| line_holds_marker(line, &markers),
+    )?;
+    for receipt in receipts {
+        if let Some(key) = receipt_key(&receipt)
+            && candidates.contains(key.0.as_str())
+        {
+            latest.insert(key, receipt);
+        }
+    }
+    Ok(latest)
+}
+
+/// Whether any JSON string on `line`, quotes included and spelled as the
+/// canonical writer spells it, is one of `markers`. A string is closed by the
+/// first quote no backslash escapes, so an escaped quote inside an id does not
+/// end it early. An unterminated string matches nothing.
+fn line_holds_marker(line: &[u8], markers: &std::collections::HashSet<String>) -> bool {
+    let mut start = 0;
+    while let Some(open) = line[start..].iter().position(|&byte| byte == b'"') {
+        let open = start + open;
+        let mut close = open + 1;
+        while close < line.len() && line[close] != b'"' {
+            close += if line[close] == b'\\' { 2 } else { 1 };
+        }
+        let Some(text) = line.get(open..=close) else {
+            return false;
+        };
+        if std::str::from_utf8(text).is_ok_and(|text| markers.contains(text)) {
+            return true;
+        }
+        start = close + 1;
+    }
+    false
+}
+
+/// Admit a candidate that has no settled receipt for its exact bytes.
+fn admit_unsettled(
+    launcher: &crate::launcher::Launcher,
+    repo: &Path,
+    record: &Value,
+    digest: &str,
+) -> Result<Value, ContractError> {
+    let candidate = crate::json::get_str(record, "candidate_id").unwrap_or_default();
+    let destination = crate::json::get_str(record, "destination").unwrap_or_default();
+    let receipt_id = receipt_id(candidate, destination, digest);
     let receipt = json!({
         "candidate_id": candidate,
         "destination": destination,
@@ -4402,7 +4557,7 @@ fn admit_candidate(
                 repo,
                 record,
                 destination,
-                &digest,
+                digest,
                 &receipt_id,
                 &receipt,
             )?;
@@ -4489,6 +4644,53 @@ fn question_for_unresolved_atom(
     };
     let alternatives: Vec<String> = uncertainty.into_iter().map(str::to_owned).collect();
     crate::questions::ensure_question(repo, &unknown, &decision, &evidence, &alternatives)
+}
+
+#[cfg(test)]
+mod line_holds_marker_tests {
+    use super::{line_holds_marker, value_marker};
+    use std::collections::HashSet;
+
+    fn markers(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| value_marker(id)).collect()
+    }
+
+    #[test]
+    fn a_line_holding_a_marked_id_as_a_value_is_kept() {
+        let line = br#"{"candidate_id":"cand_a","digest":"abc"}"#;
+        assert!(line_holds_marker(line, &markers(&["cand_a"])));
+        assert!(!line_holds_marker(line, &markers(&["cand_b"])));
+    }
+
+    #[test]
+    fn an_id_that_is_only_part_of_a_string_is_not_kept() {
+        let line = br#"{"candidate_id":"cand_ab","note":"xcand_a"}"#;
+        assert!(!line_holds_marker(line, &markers(&["cand_a"])));
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_string() {
+        // Were `\"` to close the string, `cand_a` would be read as a string
+        // of its own and the line kept for the wrong candidate.
+        let line = br#"{"note":"say \"cand_a\" twice","candidate_id":"cand_b"}"#;
+        assert!(!line_holds_marker(line, &markers(&["cand_a"])));
+        assert!(line_holds_marker(line, &markers(&["cand_b"])));
+        let escaped = value_marker("cand\"q");
+        let line = format!(r#"{{"candidate_id":{escaped}}}"#);
+        assert!(line_holds_marker(line.as_bytes(), &markers(&["cand\"q"])));
+    }
+
+    #[test]
+    fn a_torn_line_matches_nothing_and_does_not_panic() {
+        for line in [
+            &br#"{"candidate_id":"cand_a"#[..],
+            &br#"{"candidate_id":"cand_a\"#[..],
+            &br#"""#[..],
+            &b""[..],
+        ] {
+            assert!(!line_holds_marker(line, &markers(&["cand_a"])));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -156,12 +156,12 @@ pub fn ensure_dir(path: &Path, role: &str) -> Result<(), ContractError> {
 /// directory inside the Personal store (0700) used to be created 0755.
 fn create_dirs_like_parent(path: &Path) -> std::io::Result<()> {
     let mut missing = Vec::new();
-    let mut existing = path;
+    let mut existing = directory_or_cwd(path);
     while !existing.is_dir() {
         missing.push(existing);
         match existing.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
-            _ => return fs::create_dir_all(path),
+            Some(parent) => existing = directory_or_cwd(parent),
+            None => return fs::create_dir_all(path),
         }
     }
     let mode = fs::metadata(existing)?.permissions().mode() & 0o777;
@@ -169,11 +169,40 @@ fn create_dirs_like_parent(path: &Path) -> std::io::Result<()> {
     builder.mode(mode);
     for directory in missing.into_iter().rev() {
         match builder.create(directory) {
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // Another writer made it first; anything else standing there is
+            // still refused, as `create_dir_all` refuses it.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
             result => result?,
         }
     }
     Ok(())
+}
+
+/// A relative path's empty parent is the working directory.
+fn directory_or_cwd(path: &Path) -> &Path {
+    if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    }
+}
+
+/// The group and other bits a file may keep inside a directory of
+/// `directory_mode`: whoever can traverse the directory (its x bit) can open
+/// the file by name, so only those classes keep their access.
+fn reachable_bits(directory_mode: u32) -> u32 {
+    let group = if directory_mode & 0o010 != 0 {
+        0o070
+    } else {
+        0
+    };
+    let other = if directory_mode & 0o001 != 0 {
+        0o007
+    } else {
+        0
+    };
+    group | other
 }
 
 /// Durable atomic write: temp file in the same directory, fsync, rename,
@@ -185,17 +214,19 @@ pub fn write_atomic(
     mode: u32,
     immutable: bool,
 ) -> Result<bool, ContractError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ContractError::internal("atomic write target has no parent"))?;
+    let parent = directory_or_cwd(
+        path.parent()
+            .ok_or_else(|| ContractError::internal("atomic write target has no parent"))?,
+    );
     create_dirs_like_parent(parent).map_err(|error| ContractError::io("create parent", error))?;
-    // A file never grants group or other access its directory withholds: an
-    // event written 0644 into the Personal store lands 0600.
+    // A file never grants group or other access to anyone who cannot reach
+    // it through its directory: an event written 0644 into the Personal
+    // store lands 0600.
     let directory_mode = fs::metadata(parent)
         .map_err(|error| ContractError::io("read parent", error))?
         .permissions()
         .mode();
-    let mode = mode & (0o700 | (directory_mode & 0o077));
+    let mode = mode & (0o700 | reachable_bits(directory_mode));
     if immutable && path.exists() {
         let existing = fs::read(path).map_err(|error| ContractError::io("read existing", error))?;
         if existing == bytes {
@@ -411,22 +442,58 @@ mod mode_tests {
         assert_eq!(mode(&body), 0o600);
     }
 
+    /// The process umask, read from a directory created asking for 0777.
+    fn umask(dir: &Path) -> u32 {
+        let probe = dir.join("umask-probe");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o777);
+        builder.create(&probe).expect("probe");
+        !mode(&probe) & 0o777
+    }
+
     #[test]
-    fn what_is_created_under_a_shared_directory_is_no_more_open_than_it() {
+    fn what_is_created_under_a_shared_directory_takes_its_mode() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let umask = umask(dir.path());
         let root = dir.path().join("kin");
         fs::create_dir(&root).expect("root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).expect("chmod");
         let event = root.join("events").join("7a").join("event.json");
         write_atomic(&event, b"{}", 0o644, true).expect("event");
-        // The umask can only narrow these further.
-        assert_eq!(mode(&root.join("events")) & !0o750, 0);
-        assert_eq!(mode(&root.join("events").join("7a")) & !0o750, 0);
-        assert_eq!(mode(&event) & !0o640, 0);
-        assert_eq!(
-            mode(&event) & 0o600,
-            0o600,
-            "the owner keeps read and write"
-        );
+        assert_eq!(mode(&root.join("events")), 0o750 & !umask);
+        assert_eq!(mode(&root.join("events").join("7a")), 0o750 & !umask);
+        assert_eq!(mode(&event), 0o640 & !umask);
+    }
+
+    #[test]
+    fn a_file_keeps_what_its_directory_lets_a_class_reach() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let umask = umask(dir.path());
+        // Traversable but not listable: a reader who knows the name opens it.
+        let root = dir.path().join("drop");
+        fs::create_dir(&root).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o711)).expect("chmod");
+        let file = root.join("file.json");
+        write_atomic(&file, b"{}", 0o644, false).expect("file");
+        assert_eq!(mode(&file), 0o644 & !umask);
+    }
+
+    #[test]
+    fn ensuring_a_directory_where_a_file_stands_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("plain");
+        fs::write(&file, b"x").expect("file");
+        assert!(file.is_file(), "precondition");
+        assert!(ensure_dir(&file, "test").is_err());
+        assert!(write_atomic(&file.join("inner.json"), b"{}", 0o600, false).is_err());
+    }
+
+    #[test]
+    fn a_bare_filename_resolves_to_the_working_directory() {
+        // Not written here: changing this process's working directory would
+        // race every other test that reads it.
+        let parent = Path::new("bare.json").parent().expect("parent");
+        assert_eq!(directory_or_cwd(parent), Path::new("."));
+        create_dirs_like_parent(Path::new("")).expect("the working directory exists");
     }
 }

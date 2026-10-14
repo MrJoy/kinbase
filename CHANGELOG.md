@@ -17,7 +17,9 @@ Notable changes to Kinbase. Dates are UTC.
 ### Fixed
 
 - Directories Kinbase creates now take the mode of the directory they are created
-  in, and files never grant group or other access their directory withholds. The
-  Personal store's event shard directories were created 0755 and its events 0644
-  under a 0700 root; they are now 0700 and 0600. Existing stores keep their modes
-  until tightened by hand.
+  in, and a file keeps group or other access only for a class that can traverse its
+  directory. A new Personal store's event shard directories were created 0755 and
+  its events 0644 under a 0700 root; they are now 0700 and 0600. An existing store
+  keeps the modes it has, and new shards inherit them: its `events/` directories are
+  likely 0755 already. Tighten them once by hand, for example
+  `find <store> -type d -exec chmod 700 {} + && find <store> -type f -exec chmod 600 {} +`.

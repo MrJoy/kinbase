@@ -2043,19 +2043,21 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
                         )?;
                         decisions_synced = true;
                     }
-                    return Ok(Err(previous.clone()));
+                    return Ok(Admission::Settled(previous.clone()));
                 }
                 match &launcher {
-                    Ok(launcher) => admit_unsettled(launcher, &repo, candidate, &digest).map(Ok),
+                    Ok(launcher) => {
+                        admit_unsettled(launcher, &repo, candidate, &digest).map(Admission::Decided)
+                    }
                     Err(error) => Err(error.clone()),
                 }
             })();
             match admitted {
-                Ok(Err(previous)) => {
+                Ok(Admission::Settled(previous)) => {
                     settled.insert(admissions.len());
                     admissions.push(previous);
                 }
-                Ok(Ok(receipt)) => admissions.push(receipt),
+                Ok(Admission::Decided(receipt)) => admissions.push(receipt),
                 Err(error) if error.code == "REPO_UNCERTIFIED" => {
                     // Not a failure: this host simply has nowhere to put a
                     // shared candidate yet. Holding it says so once and keeps
@@ -4430,6 +4432,16 @@ fn candidate_digest(record: &Value) -> Result<String, ContractError> {
     Ok(digest)
 }
 
+/// What a checkpoint got for one candidate. A settled receipt is returned to
+/// the host but only counted in the recorded checkpoint, so the two cases
+/// have to stay apart until the record is written.
+enum Admission {
+    /// A receipt an earlier admission of the same bytes settled.
+    Settled(Value),
+    /// The receipt this checkpoint's admission produced.
+    Decided(Value),
+}
+
 /// What a receipt decides: one candidate's exact bytes for one destination.
 type ReceiptKey = (String, String, String);
 
@@ -4477,24 +4489,7 @@ fn latest_receipts(
         crate::StoreKind::Personal,
         &repo,
         "proposal-decisions.jsonl",
-        |line| {
-            let mut start = 0;
-            while let Some(open) = line[start..].iter().position(|&byte| byte == b'"') {
-                let open = start + open;
-                let mut close = open + 1;
-                while close < line.len() && line[close] != b'"' {
-                    close += if line[close] == b'\\' { 2 } else { 1 };
-                }
-                let Some(text) = line.get(open..=close) else {
-                    return false;
-                };
-                if std::str::from_utf8(text).is_ok_and(|text| markers.contains(text)) {
-                    return true;
-                }
-                start = close + 1;
-            }
-            false
-        },
+        |line| line_holds_marker(line, &markers),
     )?;
     for receipt in receipts {
         if let Some(key) = receipt_key(&receipt)
@@ -4504,6 +4499,29 @@ fn latest_receipts(
         }
     }
     Ok(latest)
+}
+
+/// Whether any JSON string on `line`, quotes included and spelled as the
+/// canonical writer spells it, is one of `markers`. A string is closed by the
+/// first quote no backslash escapes, so an escaped quote inside an id does not
+/// end it early. An unterminated string matches nothing.
+fn line_holds_marker(line: &[u8], markers: &std::collections::HashSet<String>) -> bool {
+    let mut start = 0;
+    while let Some(open) = line[start..].iter().position(|&byte| byte == b'"') {
+        let open = start + open;
+        let mut close = open + 1;
+        while close < line.len() && line[close] != b'"' {
+            close += if line[close] == b'\\' { 2 } else { 1 };
+        }
+        let Some(text) = line.get(open..=close) else {
+            return false;
+        };
+        if std::str::from_utf8(text).is_ok_and(|text| markers.contains(text)) {
+            return true;
+        }
+        start = close + 1;
+    }
+    false
 }
 
 /// Admit a candidate that has no settled receipt for its exact bytes.
@@ -4626,6 +4644,53 @@ fn question_for_unresolved_atom(
     };
     let alternatives: Vec<String> = uncertainty.into_iter().map(str::to_owned).collect();
     crate::questions::ensure_question(repo, &unknown, &decision, &evidence, &alternatives)
+}
+
+#[cfg(test)]
+mod line_holds_marker_tests {
+    use super::{line_holds_marker, value_marker};
+    use std::collections::HashSet;
+
+    fn markers(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| value_marker(id)).collect()
+    }
+
+    #[test]
+    fn a_line_holding_a_marked_id_as_a_value_is_kept() {
+        let line = br#"{"candidate_id":"cand_a","digest":"abc"}"#;
+        assert!(line_holds_marker(line, &markers(&["cand_a"])));
+        assert!(!line_holds_marker(line, &markers(&["cand_b"])));
+    }
+
+    #[test]
+    fn an_id_that_is_only_part_of_a_string_is_not_kept() {
+        let line = br#"{"candidate_id":"cand_ab","note":"xcand_a"}"#;
+        assert!(!line_holds_marker(line, &markers(&["cand_a"])));
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_string() {
+        // Were `\"` to close the string, `cand_a` would be read as a string
+        // of its own and the line kept for the wrong candidate.
+        let line = br#"{"note":"say \"cand_a\" twice","candidate_id":"cand_b"}"#;
+        assert!(!line_holds_marker(line, &markers(&["cand_a"])));
+        assert!(line_holds_marker(line, &markers(&["cand_b"])));
+        let escaped = value_marker("cand\"q");
+        let line = format!(r#"{{"candidate_id":{escaped}}}"#);
+        assert!(line_holds_marker(line.as_bytes(), &markers(&["cand\"q"])));
+    }
+
+    #[test]
+    fn a_torn_line_matches_nothing_and_does_not_panic() {
+        for line in [
+            &br#"{"candidate_id":"cand_a"#[..],
+            &br#"{"candidate_id":"cand_a\"#[..],
+            &br#"""#[..],
+            &b""[..],
+        ] {
+            assert!(!line_holds_marker(line, &markers(&["cand_a"])));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -22,6 +22,13 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Compact the Personal ledgers by identity and bring their index up to
+    /// date, off the hook path. SessionEnd starts one when it is due.
+    Dream {
+        /// Dream even when one finished within the day.
+        #[arg(long)]
+        force: bool,
+    },
     Ingest {
         source_kind: String,
         source: PathBuf,

@@ -789,6 +789,14 @@ fn dispatch_event(
             }
             merge(&mut response, checkpoint);
             admission_failure = failure;
+            // The session is over: compaction and indexing run now, detached,
+            // when a dream is due, never inside a hook.
+            if event_type != "Stop" {
+                crate::dream::start_if_due(&crate::store::store_root(
+                    crate::StoreKind::Personal,
+                    &cwd,
+                ));
+            }
         }
         "PreToolUse" | "pre-edit" => {
             merge(

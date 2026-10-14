@@ -264,6 +264,69 @@ fn a_prompt_reaches_the_sessions_checkpoint() {
     );
 }
 
+#[test]
+fn the_same_prompt_seen_again_adds_no_record() {
+    // A record seen again with only a new timestamp is the same record. The
+    // whole-line duplicate check missed it (observed_at differs), so every
+    // ledger the worker writes grew with each repeat.
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let prompt = json!({
+        "session_id": "host-session-14",
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "We decided to keep the retry budget at three attempts."
+    });
+    let ledgers = [
+        "observations.jsonl",
+        "session-events.jsonl",
+        "atoms.jsonl",
+        "candidates.jsonl",
+    ];
+    let counts = || {
+        ledgers
+            .iter()
+            .map(|name| {
+                fs::read_to_string(world.personal.join(name))
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>()
+    };
+    let submit = || {
+        let output = kinbase(
+            &world,
+            &["hooks", "dispatch", "claude", "UserPromptSubmit"],
+            &[],
+            prompt.to_string().as_bytes(),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while fs::read_dir(pending_dir(&world))
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
+    submit();
+    let first = counts();
+    assert!(first[0] >= 1, "the prompt was observed: {first:?}");
+    // observed_at is stamped in milliseconds: make the repeat's differ.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    submit();
+    assert_eq!(counts(), first, "{ledgers:?}");
+}
+
 fn pending_dir(world: &World) -> PathBuf {
     world.personal.join("pending-observations")
 }
@@ -618,12 +681,14 @@ fn a_later_stop_counts_an_admitted_candidate_instead_of_admitting_it_again() {
         decisions,
         "nothing is decided twice"
     );
+    // The second Stop decided nothing: it is not recorded.
+    assert_eq!(first["checkpoint_recorded"], true, "{first}");
+    assert_eq!(second["checkpoint_recorded"], false, "{second}");
     let checkpoints =
         fs::read_to_string(world.personal.join("session-checkpoints.jsonl")).expect("checkpoints");
     let lines: Vec<&str> = checkpoints.lines().collect();
-    assert_eq!(lines.len(), 2, "{checkpoints}");
+    assert_eq!(lines.len(), 1, "{checkpoints}");
     assert!(lines[0].contains("\"candidate_id\":\"cand_c\""));
-    assert!(!lines[1].contains("cand_c"), "{}", lines[1]);
 }
 
 #[test]
@@ -644,7 +709,8 @@ fn a_precompact_checkpoints_the_session_and_allows_the_compaction() {
     ));
     assert_eq!(receipt["compact_allowed"], true, "{receipt}");
     assert_eq!(receipt["checkpointed"], true, "{receipt}");
-    let ledger = fs::read_to_string(world.personal.join("session-checkpoints.jsonl"))
-        .expect("the checkpoint is written");
-    assert!(ledger.contains("\"session_id\":\"host-session-compact\""));
+    // A checkpoint that decided nothing carries only counters the ledgers
+    // already hold, so it is not recorded.
+    assert_eq!(receipt["checkpoint_recorded"], false, "{receipt}");
+    assert!(!world.personal.join("session-checkpoints.jsonl").exists());
 }

@@ -26,6 +26,7 @@ pub mod http;
 pub mod ingest;
 pub mod json;
 pub mod launcher;
+pub mod ledger_index;
 pub mod lifecycle;
 pub mod model;
 pub mod output;

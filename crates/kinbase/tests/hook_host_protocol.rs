@@ -264,6 +264,69 @@ fn a_prompt_reaches_the_sessions_checkpoint() {
     );
 }
 
+#[test]
+fn the_same_prompt_seen_again_adds_no_record() {
+    // A record seen again with only a new timestamp is the same record. The
+    // whole-line duplicate check missed it (observed_at differs), so every
+    // ledger the worker writes grew with each repeat.
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let prompt = json!({
+        "session_id": "host-session-14",
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "We decided to keep the retry budget at three attempts."
+    });
+    let ledgers = [
+        "observations.jsonl",
+        "session-events.jsonl",
+        "atoms.jsonl",
+        "candidates.jsonl",
+    ];
+    let counts = || {
+        ledgers
+            .iter()
+            .map(|name| {
+                fs::read_to_string(world.personal.join(name))
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>()
+    };
+    let submit = || {
+        let output = kinbase(
+            &world,
+            &["hooks", "dispatch", "claude", "UserPromptSubmit"],
+            &[],
+            prompt.to_string().as_bytes(),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while fs::read_dir(pending_dir(&world))
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
+    submit();
+    let first = counts();
+    assert!(first[0] >= 1, "the prompt was observed: {first:?}");
+    // observed_at is stamped in milliseconds: make the repeat's differ.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    submit();
+    assert_eq!(counts(), first, "{ledgers:?}");
+}
+
 fn pending_dir(world: &World) -> PathBuf {
     world.personal.join("pending-observations")
 }

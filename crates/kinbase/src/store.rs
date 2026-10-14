@@ -172,6 +172,48 @@ pub fn read_records_where(
     read_jsonl_where(&root.join(filename), keep)
 }
 
+/// The records of `filename` whose `field` holds one of `values`, in ledger
+/// order, looked up in the ledger's identity index (`ledger_index`) rather
+/// than by scanning it. A ledger not indexed by `field`, or an index that
+/// cannot answer, is streamed with `fallback` instead, a line predicate the
+/// caller's exact filter refines either way. Kept lines are parsed and
+/// reported as `read_records_where` does, except that a skipped line's
+/// `position` counts the kept lines, since the index does not number the
+/// ledger's.
+pub fn read_records_tagged(
+    store: crate::StoreKind,
+    repo: &Path,
+    filename: &str,
+    field: &str,
+    values: &[&str],
+    fallback: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<Value>, ContractError> {
+    let path = store_root(store, repo).join(filename);
+    match crate::ledger_index::read_tagged(&path, field, values) {
+        Ok(Some(lines)) => {
+            let mut skipped = crate::output::Skipped::default();
+            let mut output = Vec::with_capacity(lines.len());
+            for (position, line) in lines.iter().enumerate() {
+                match parse_strict_object(line) {
+                    Ok(map) => output.push(Value::Object(map)),
+                    Err(_) => skipped.push(
+                        position + 1,
+                        line.len(),
+                        crate::output::unreadable_reason(line),
+                    ),
+                }
+            }
+            skipped.report(filename);
+            Ok(output)
+        }
+        Ok(None) => read_jsonl_where(&path, fallback),
+        Err(error) => {
+            crate::ledger_index::unavailable(filename, &error, "streamed the ledger instead");
+            read_jsonl_where(&path, fallback)
+        }
+    }
+}
+
 /// Where `needle` first occurs in `haystack`, for marker checks on raw
 /// ledger bytes. A line is small and a marker starts with a quote, so a
 /// first-byte scan with an early-exit compare is enough, and nothing is
@@ -458,6 +500,31 @@ fn append_jsonl_with(
             std::io::Error::last_os_error(),
         ));
     }
+    // A ledger of entities is checked by identity against its persisted index
+    // (`ledger_index`), which reads only what was appended since it last
+    // looked; the whole-line check below reads the whole ledger in every
+    // fresh process and misses a record seen again with a new timestamp.
+    if check_present && let Some(spec) = crate::ledger_index::spec_for(path) {
+        match crate::ledger_index::append(path, &file, spec, &canonical, || {
+            write_line(&file, path, canonical.as_bytes())
+        }) {
+            Ok(_) => {
+                if durable {
+                    sync_ledger(&file, path)?;
+                }
+                return Ok(());
+            }
+            // Nothing was written: append the way an unindexed ledger does.
+            Err(error) => crate::ledger_index::unavailable(
+                &path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                &error,
+                "appended with the whole-ledger duplicate check",
+            ),
+        }
+    }
     if check_present && line_present(&file, path, canonical.as_bytes())? {
         // An earlier attempt may have written the line and failed to sync it;
         // a durable append returns only once the line is on disk.
@@ -466,6 +533,17 @@ fn append_jsonl_with(
         }
         return Ok(());
     }
+    write_line(&file, path, canonical.as_bytes())?;
+    line_appended(&file, path, canonical.as_bytes());
+    if durable {
+        sync_ledger(&file, path)?;
+    }
+    Ok(())
+}
+
+/// Append `canonical` as one line of the locked ledger `file`; returns the
+/// offset the record starts at.
+fn write_line(mut file: &fs::File, path: &Path, canonical: &[u8]) -> Result<u64, ContractError> {
     // A write cut short (a full disk, a crash before the page cache reached
     // the disk) leaves a last line with no terminator. Appending straight
     // after it glued the new record onto the torn one and both read back as
@@ -487,15 +565,12 @@ fn append_jsonl_with(
             );
         }
     }
-    line.extend_from_slice(canonical.as_bytes());
+    let offset = length + line.len() as u64;
+    line.extend_from_slice(canonical);
     line.push(b'\n');
     file.write_all(&line)
         .map_err(|error| ContractError::io("write JSONL", error))?;
-    line_appended(&file, path, canonical.as_bytes());
-    if durable {
-        sync_ledger(&file, path)?;
-    }
-    Ok(())
+    Ok(offset)
 }
 
 fn sync_ledger(file: &fs::File, path: &Path) -> Result<(), ContractError> {

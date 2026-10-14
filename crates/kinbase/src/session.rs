@@ -1991,9 +1991,12 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
     })?;
     let session_marker = format!("\"session_id\":{canonical_session}");
     let mut candidates = BTreeMap::new();
-    for candidate in personal_records_where("candidates.jsonl", |line| {
-        crate::store::bytes_contain(line, session_marker.as_bytes())
-    }) {
+    for candidate in personal_records_tagged(
+        "candidates.jsonl",
+        "session_id",
+        &[session_text.as_str()],
+        |line| crate::store::bytes_contain(line, session_marker.as_bytes()),
+    ) {
         if crate::json::get_str(&candidate, "session_id") == Some(session_text.as_str())
             && crate::json::get_str(&candidate, "admission_mode") == Some("automatic")
         {
@@ -2083,9 +2086,12 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
         "\"source_identity\":{}",
         crate::json::jcs_text(&Value::String(source_identity.clone()))
     );
-    let observations = personal_records_where("observations.jsonl", |line| {
-        crate::store::bytes_contain(line, source_marker.as_bytes())
-    })
+    let observations = personal_records_tagged(
+        "observations.jsonl",
+        "source_identity",
+        &[source_identity.as_str()],
+        |line| crate::store::bytes_contain(line, source_marker.as_bytes()),
+    )
     .into_iter()
     .filter(|record| {
         record.get("source_identity").and_then(Value::as_str) == Some(&source_identity)
@@ -2102,7 +2108,8 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
         Vec::new()
     } else {
         const ATOM_KEY: &[u8] = b"\"observation_id\":\"";
-        personal_records_where("atoms.jsonl", |line| {
+        let ids = observation_ids.iter().copied().collect::<Vec<_>>();
+        personal_records_tagged("atoms.jsonl", "observation_id", &ids, |line| {
             crate::store::bytes_find(line, ATOM_KEY).is_some_and(|start| {
                 let rest = &line[start + ATOM_KEY.len()..];
                 rest.iter()
@@ -2333,6 +2340,37 @@ fn personal_records_where(name: &str, keep: impl Fn(&[u8]) -> bool) -> Vec<Value
         return Vec::new();
     };
     match crate::store::read_records_where(crate::StoreKind::Personal, &repo, name, keep) {
+        Ok(records) => records,
+        Err(error) => {
+            crate::output::diagnostic(
+                "unreadable-ledger",
+                json!({"ledger": name, "code": error.code, "message": error.message}),
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// `personal_records_where` for the records whose `field` holds one of
+/// `values`, looked up in the ledger's identity index; `fallback` streams the
+/// ledger when the index cannot answer (`store::read_records_tagged`).
+fn personal_records_tagged(
+    name: &str,
+    field: &str,
+    values: &[&str],
+    fallback: impl Fn(&[u8]) -> bool,
+) -> Vec<Value> {
+    let Ok(repo) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    match crate::store::read_records_tagged(
+        crate::StoreKind::Personal,
+        &repo,
+        name,
+        field,
+        values,
+        fallback,
+    ) {
         Ok(records) => records,
         Err(error) => {
             crate::output::diagnostic(

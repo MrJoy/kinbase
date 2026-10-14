@@ -225,8 +225,26 @@ fn is_one_program_word(program: &str) -> bool {
             c.is_whitespace()
                 || matches!(
                     c,
-                    ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`' | '$' | '"' | '\'' | '\\' | '#'
-                        | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '!'
+                    ';' | '&'
+                        | '|'
+                        | '('
+                        | ')'
+                        | '<'
+                        | '>'
+                        | '`'
+                        | '$'
+                        | '"'
+                        | '\''
+                        | '\\'
+                        | '#'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '~'
+                        | '!'
                 )
         })
 }
@@ -657,13 +675,40 @@ fn dispatch_event(
     // named form, value by value before anything is encoded or framed. The
     // launcher is loaded only now, with the envelope's target set.
     let scrubber = crate::launcher::Launcher::load().ok();
-    let scrub = |text: &str| match &scrubber {
-        Some(launcher) => launcher.scrub_for_hook(text),
-        None => text.to_owned(),
+    // Known secrets in the envelope (a prompt, a tool input) become `$NAME`
+    // before anything below queues, records or echoes them
+    // (`crate::secret_mask`; installed when the launcher above read the user
+    // config); identifiers such as `session_id` and `cwd` are never
+    // rewritten.
+    let secrets = crate::secret_mask::active_table();
+    let map = match &secrets {
+        Some(table) => {
+            let mut envelope = Value::Object(map);
+            crate::secret_mask::mask_value_with(&mut envelope, table);
+            match envelope {
+                Value::Object(map) => map,
+                _ => Map::new(),
+            }
+        }
+        None => map,
     };
-    let scrub_values = |values: &mut Vec<Value>| {
-        if let Some(launcher) = &scrubber {
-            for value in values.iter_mut() {
+    // Output loses known secrets, then other Companies' destinations.
+    let redact = |text: &str| {
+        let masked = match &secrets {
+            Some(table) => crate::secret_mask::mask_text(text, table),
+            None => text.to_owned(),
+        };
+        match &scrubber {
+            Some(launcher) => launcher.scrub_for_hook(&masked),
+            None => masked,
+        }
+    };
+    let redact_values = |values: &mut Vec<Value>| {
+        for value in values.iter_mut() {
+            if let Some(table) = &secrets {
+                crate::secret_mask::mask_value_with(value, table);
+            }
+            if let Some(launcher) = &scrubber {
                 launcher.scrub_value_for_hook(value);
             }
         }
@@ -781,7 +826,7 @@ fn dispatch_event(
                 // candidate's outcome goes there, not just the refusal. A
                 // held candidate is reported the same way and exits zero.
                 for line in crate::session::admission_lines(&checkpoint) {
-                    eprintln!("{}", scrub(&line));
+                    eprintln!("{}", redact(&line));
                 }
             }
             merge(&mut response, checkpoint);
@@ -809,7 +854,7 @@ fn dispatch_event(
                 .unwrap_or(0);
             if (failure.is_some() || held > 0) && !json {
                 for line in crate::session::admission_lines(&checkpoint) {
-                    eprintln!("{}", scrub(&line));
+                    eprintln!("{}", redact(&line));
                 }
             }
             merge(&mut response, checkpoint);
@@ -834,9 +879,11 @@ fn dispatch_event(
             })
             .collect()
     };
-    scrub_values(&mut canonical_facts);
-    scrub_values(&mut unknowns);
-    scrub_values(&mut start.trusted_company_facts);
+    // Redacted value by value before anything is bounded, encoded or framed,
+    // so the frame lengths describe the redacted text.
+    redact_values(&mut canonical_facts);
+    redact_values(&mut unknowns);
+    redact_values(&mut start.trusted_company_facts);
     let bounded = bound_evidence(&canonical_facts, &unknowns, &start.trusted_company_facts);
     let stream_body = json!({
         "facts": encode(&bounded.facts),
@@ -857,6 +904,9 @@ fn dispatch_event(
         // fractional connect time); the durable-record text rule does not
         // apply to it, JCS ordering and escaping do.
         let mut response = response;
+        if let Some(table) = &secrets {
+            crate::secret_mask::mask_value_with(&mut response, table);
+        }
         if let Some(launcher) = &scrubber {
             launcher.scrub_value_for_hook(&mut response);
         }
@@ -1393,7 +1443,12 @@ fn hook_config_has_entries(host: &str, text: &str) -> Option<bool> {
         if let Some(command) = handler.get("command").and_then(Value::as_str) {
             found.push(command.to_owned());
         }
-        for nested in handler.get("hooks").and_then(Value::as_array).into_iter().flatten() {
+        for nested in handler
+            .get("hooks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             if let Some(command) = nested.get("command").and_then(Value::as_str) {
                 found.push(command.to_owned());
             }

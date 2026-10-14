@@ -730,10 +730,10 @@ fn path_revision(repo: &Repository, relpath: &str) -> Option<String> {
 /// Every other bulk adapter gives each observation a unique logical key --
 /// `git_history:commit:<sha>`, `repo_code:<path>` -- so two facts never contest
 /// the same key, no conflict is ever detected, and the ruling loop cannot fire
-/// on ingested evidence at all. Wander's 83,655 facts produced zero questions.
+/// on ingested evidence at all. one deployment's corpus of 83,655 facts produced zero questions.
 /// A symbol name is a subject that several definitions can genuinely disagree
 /// about, and disagreement is what the reducer needs to see before it can ask a
-/// human which definition is current. Measured across seven Wander services:
+/// human which definition is current. Measured across seven services of one deployment:
 /// `Db` is defined six times in five shapes, `ObservabilityLayer` seven times
 /// in seven shapes. That is the founder's "which of the five ways do I
 /// emulate, or is it none of them" as data rather than as a complaint.
@@ -869,7 +869,7 @@ fn scan_repo_symbols(source: &Path, repo: &Repository) -> Result<SourceScan, Con
 
 /// Above this many definitions of one name in one repository, the name is a
 /// convention rather than a contested subject and each definition gets its own
-/// key. Chosen from the data: real duplications at Wander run two to eight
+/// key. Chosen from the data: real duplications in one deployment run two to eight
 /// (`Db` eight, `ObservabilityLayer` seven), while conventions run to fifty.
 const CONVENTION_THRESHOLD: usize = 8;
 
@@ -1539,7 +1539,7 @@ fn scan_issue_tracker(source: &Path, _repo: &Repository) -> Result<SourceScan, C
             }
 
             // Every outbound link is an edge in the association graph. Labels are the
-            // subjects: `wandercom/app.wander.com` names a component, `Bug` names a
+            // subjects: `example/web-app` names a component, `Bug` names a
             // kind, and a label that recurs across tickets pointing at one span is
             // exactly the signal we want to accumulate.
             let mut references = Vec::new();
@@ -1977,7 +1977,7 @@ fn scan_git_history(
     let mut scan = SourceScan::default();
     let default = repo.default_branch();
     // Ingest refuses a batch over 10,000 observations, and the adapter cannot page:
-    // `scan` never receives the checkpoint. Wander's largest repository has 148,004
+    // `scan` never receives the checkpoint. The largest repository measured has 148,004
     // commits, so an unbounded walk produced nothing at all -- the whole batch was
     // refused and the repository ended up with no code history whatsoever.
     //
@@ -2581,7 +2581,7 @@ fn scan_kindex(source: &Path, repo: &Repository) -> Result<SourceScan, ContractE
         // reads the schema Kindex actually ships rather than an export format it
         // never emitted. The columns were guessed once and never run against a real
         // store: `node_type` and `payload` do not exist, and the query failed on
-        // every one of the 87 populated Kindex databases at Wander.
+        // every one of 87 populated Kindex databases in one deployment.
         //
         // Real Kindex carries more than Kinbase asked for, and the extra columns are
         // exactly the ones this product needs: `prov_who` and `prov_source` are
@@ -3413,8 +3413,9 @@ fn revocation_of(trust: &TrustFacts, observation: &Observation) -> Option<String
         // no authority left to warrant them. But a revocation is an event
         // that happened, with a time. When nothing has ever been revoked, a
         // registry that simply never named a per-repository owner is not a
-        // revocation, and reporting one made every certified repository at
-        // Wander show ~45,000 "revoked" unknowns over a store nobody revoked.
+        // revocation, and reporting one made every certified repository in the
+        // measured deployment show ~45,000 "revoked" unknowns over a store
+        // nobody had revoked.
         let nothing_revoked = trust.revocations.is_empty()
             && trust
                 .governing_revoked_keys

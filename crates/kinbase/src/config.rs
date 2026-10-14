@@ -146,6 +146,10 @@ pub struct UserConfig {
     /// `[identity] share_maintainer_key = true`.
     pub share_maintainer_key: bool,
     pub classifier: Option<ClassifierConfig>,
+    /// `[secret_mask]`: known secrets masked before anything is written,
+    /// signed or printed (`crate::secret_mask`). `None` is off; only this
+    /// file can turn it on.
+    pub secret_mask: Option<crate::secret_mask::SecretMaskConfig>,
     pub hosts: HostsConfig,
     pub scanner: ScannerConfig,
     pub principal_id: String,
@@ -385,18 +389,32 @@ fn authorized_processor(value: &toml::Value) -> Result<AuthorizedProcessor, Cont
             .and_then(toml::Value::as_str)
             .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))
             .map(str::to_owned)
-            .ok_or_else(|| config_error(format!("personal.kindex_processors entries need {name} (text without spaces)")))
+            .ok_or_else(|| {
+                config_error(format!(
+                    "personal.kindex_processors entries need {name} (text without spaces)"
+                ))
+            })
     };
     let key_env = field("key_env")?;
     if !(key_env.len() > "_API_KEY".len()
         && key_env.ends_with("_API_KEY")
-        && key_env.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        && key_env
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
     {
-        return Err(config_error("personal.kindex_processors key_env must be a variable ending in _API_KEY"));
+        return Err(config_error(
+            "personal.kindex_processors key_env must be a variable ending in _API_KEY",
+        ));
     }
     let key_sha256 = field("key_sha256")?;
-    if key_sha256.len() != 64 || !key_sha256.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
-        return Err(config_error("personal.kindex_processors key_sha256 must be the key's SHA-256 in lowercase hex"));
+    if key_sha256.len() != 64
+        || !key_sha256
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        return Err(config_error(
+            "personal.kindex_processors key_sha256 must be the key's SHA-256 in lowercase hex",
+        ));
     }
     Ok(AuthorizedProcessor {
         provider: field("provider")?,
@@ -419,9 +437,19 @@ fn personal_kindex(table: &toml::Table) -> Result<Option<PersonalKindexConfig>, 
         return Ok(None);
     }
     let Some(executable) = optional_path(table, "kindex_executable", "personal")? else {
-        for key in ["kindex_executable_sha256", "kindex_config", "kindex_timeout_seconds", "kindex_digest", "kindex_retention_seconds", "kindex_processors", "kindex_team_knowledge"] {
+        for key in [
+            "kindex_executable_sha256",
+            "kindex_config",
+            "kindex_timeout_seconds",
+            "kindex_digest",
+            "kindex_retention_seconds",
+            "kindex_processors",
+            "kindex_team_knowledge",
+        ] {
             if table.contains_key(key) {
-                return Err(config_error(format!("personal.{key} requires personal.kindex_executable")));
+                return Err(config_error(format!(
+                    "personal.{key} requires personal.kindex_executable"
+                )));
             }
         }
         return Ok(None);
@@ -437,8 +465,9 @@ fn personal_kindex(table: &toml::Table) -> Result<Option<PersonalKindexConfig>, 
         Some(value) => value
             .as_integer()
             .filter(|seconds| *seconds > 0)
-            .ok_or_else(|| config_error("personal.kindex_timeout_seconds must be a positive integer"))?
-            as u64,
+            .ok_or_else(|| {
+                config_error("personal.kindex_timeout_seconds must be a positive integer")
+            })? as u64,
     };
     let digest = match table.get("kindex_digest") {
         None => false,
@@ -452,7 +481,9 @@ fn personal_kindex(table: &toml::Table) -> Result<Option<PersonalKindexConfig>, 
             value
                 .as_integer()
                 .filter(|seconds| *seconds > 0)
-                .ok_or_else(|| config_error("personal.kindex_retention_seconds must be a positive integer"))?,
+                .ok_or_else(|| {
+                    config_error("personal.kindex_retention_seconds must be a positive integer")
+                })?,
         ),
     };
     let processors = match table.get("kindex_processors") {
@@ -512,12 +543,17 @@ pub fn enforce_private_file(path: &Path, role: &str) -> Result<(), ContractError
 pub fn load_user_config() -> Result<Option<UserConfig>, ContractError> {
     let path = user_config_path();
     if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
+        crate::secret_mask::configure(None);
         return Ok(None);
     }
     enforce_private_file(&path, "user config")?;
     let text = std::fs::read_to_string(&path)
         .map_err(|error| ContractError::unreadable("user config", &error))?;
     let mut user = parse_user_config(&path, &text)?;
+    // The mask is installed by reading the user config and by nothing else:
+    // a repository's config, the environment and the process cwd cannot
+    // turn it on, off or narrower.
+    crate::secret_mask::configure(user.secret_mask.as_ref());
     // Under the named form `company` becomes the one Company this
     // invocation's target resolves to; under the single form it stays as read.
     crate::selection::apply(&mut user);
@@ -542,6 +578,7 @@ pub fn parse_user_config(path: &Path, text: &str) -> Result<UserConfig, Contract
             "hosts",
             "scanner",
             "identity",
+            "secret_mask",
         ],
         "user config",
     )?;
@@ -803,10 +840,73 @@ pub fn parse_user_config(path: &Path, text: &str) -> Result<UserConfig, Contract
         share_maintainer_key,
         companies,
         classifier,
+        secret_mask: match table.get("secret_mask") {
+            None => None,
+            Some(value) => Some(secret_mask_section(value)?),
+        },
         hosts,
         scanner,
         principal_id,
         host_instance_id,
+    })
+}
+
+/// `[secret_mask]`: the env files whose values are masked, which names in
+/// them are secrets, and the shortest value worth masking.
+fn secret_mask_section(
+    value: &toml::Value,
+) -> Result<crate::secret_mask::SecretMaskConfig, ContractError> {
+    let section = value
+        .as_table()
+        .ok_or_else(|| config_error("[secret_mask] must be a table"))?;
+    closed_keys(section, &["files", "keys", "min_length"], "[secret_mask]")?;
+    let strings = |key: &str| -> Result<Option<Vec<String>>, ContractError> {
+        let Some(value) = section.get(key) else {
+            return Ok(None);
+        };
+        let malformed = || config_error(format!("secret_mask.{key} must be an array of strings"));
+        value
+            .as_array()
+            .ok_or_else(malformed)?
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(malformed))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    };
+    // There is no default file: a table that names none masks nothing.
+    let files = strings("files")?
+        .unwrap_or_default()
+        .iter()
+        .map(|file| {
+            // `~/` is the user's home, as the shell reads the same file.
+            let expanded = match file.strip_prefix("~/") {
+                Some(rest) => paths::home_dir().join(rest).to_string_lossy().into_owned(),
+                None => file.clone(),
+            };
+            absolute(&expanded, "secret_mask.files")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let keys = strings("keys")?;
+    if keys
+        .as_ref()
+        .is_some_and(|keys| keys.iter().any(|key| key.trim_matches('*').is_empty()))
+    {
+        return Err(config_error(
+            "secret_mask.keys holds an empty selector; name a variable or a fragment of one",
+        ));
+    }
+    let min_length = match section.get("min_length") {
+        None => crate::secret_mask::DEFAULT_MIN_LENGTH,
+        Some(value) => value
+            .as_integer()
+            .filter(|length| *length >= 1)
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| config_error("secret_mask.min_length must be a positive integer"))?,
+    };
+    Ok(crate::secret_mask::SecretMaskConfig {
+        files,
+        keys,
+        min_length,
     })
 }
 
@@ -1496,14 +1596,19 @@ mod personal_recall_build_tests {
         let text = "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\nkindex_executable = \"/opt/example/bin/kin\"\n";
         let error = parse_user_config(Path::new("/private/example/config.toml"), text)
             .expect_err("refused");
-        assert!(error.message.contains("personal-recall"), "{}", error.message);
-        let plain = "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\n";
-        let config = parse_user_config(Path::new("/private/example/config.toml"), plain).expect("parses");
+        assert!(
+            error.message.contains("personal-recall"),
+            "{}",
+            error.message
+        );
+        let plain =
+            "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\n";
+        let config =
+            parse_user_config(Path::new("/private/example/config.toml"), plain).expect("parses");
         assert!(config.personal.kindex.is_none());
     }
 }
 
-#[cfg(test)]
 mod named_company_tests {
     use super::*;
 
@@ -1590,5 +1695,51 @@ mod named_company_tests {
         assert!(named("\"github.com/acme/***\"").is_err());
         assert!(named("\"  \"").is_err());
         assert!(named("42").is_err());
+    }
+}
+
+#[cfg(test)]
+mod secret_mask_config_tests {
+    use super::*;
+
+    fn parse(section: &str) -> Result<UserConfig, ContractError> {
+        let text = format!(
+            "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\n\n{section}"
+        );
+        parse_user_config(Path::new("/private/example/config.toml"), &text)
+    }
+
+    #[test]
+    fn an_absent_table_is_off_and_a_present_one_is_read_whole() {
+        assert!(parse("").unwrap().secret_mask.is_none());
+        let config = parse(
+            "[secret_mask]\nfiles = [\"/private/example/env\", \"~/.profile\"]\nkeys = [\"github\", \"AWS_*_KEY\"]\nmin_length = 12\n",
+        )
+        .unwrap()
+        .secret_mask
+        .unwrap();
+        assert_eq!(config.files[0], Path::new("/private/example/env"));
+        assert!(config.files[1].is_absolute() && config.files[1].ends_with(".profile"));
+        assert_eq!(config.keys.as_deref().unwrap(), ["github", "AWS_*_KEY"]);
+        assert_eq!(config.min_length, 12);
+        // No default file: a table that names none masks nothing.
+        let empty = parse("[secret_mask]\n").unwrap().secret_mask.unwrap();
+        assert!(empty.files.is_empty() && empty.keys.is_none());
+        assert_eq!(empty.min_length, crate::secret_mask::DEFAULT_MIN_LENGTH);
+    }
+
+    #[test]
+    fn a_malformed_table_is_refused_when_read() {
+        for section in [
+            "[secret_mask]\nfiles = [\"relative/env\"]\n",
+            "[secret_mask]\nfiles = \"/private/example/env\"\n",
+            "[secret_mask]\nkeys = [\"*\"]\n",
+            "[secret_mask]\nmin_length = 0\n",
+            "[secret_mask]\nmin_length = \"8\"\n",
+            "[secret_mask]\nenabled = false\n",
+            "secret_mask = \"off\"\n",
+        ] {
+            assert!(parse(section).is_err(), "accepted: {section}");
+        }
     }
 }

@@ -102,7 +102,7 @@ pub const ATOM_KINDS: [&str; 14] = [
 /// Truth-value hierarchy, strongest first.
 ///
 /// The problem this solves: in a brownfield repository, frequency is not authority.
-/// `wander/` has more commits than any other repository and is being retired. Five
+/// `monorepo/` has more commits than any other repository and is being retired. Five
 /// implementations of one thing may exist and none of them be right. Nothing in the
 /// evidence itself says which signal wins, so a rank has to be carried explicitly.
 ///
@@ -110,9 +110,9 @@ pub const ATOM_KINDS: [&str; 14] = [
 /// is how much weight the claim carries when evidence disagrees.
 /// Whose word it is, which decides how high a fact may rank.
 ///
-/// Jeremy's point, and it is the ordering the company actually runs on: a directive
-/// he gives directly outranks his own architecture documents, which outrank
-/// everything else. And software is compromise, so none of this is absolute -- a
+/// The founder's point, and it is the ordering a company actually runs on: a directive
+/// the founder gives directly outranks the architecture documents they wrote, which
+/// outrank everything else. And software is compromise, so none of this is absolute -- a
 /// higher standing demotes weaker evidence to `present`, it never deletes it. The
 /// code that contradicts a north star stays retrievable and stops being direction.
 pub const AUTHORITY_TIERS: [&str; 3] = [
@@ -641,7 +641,7 @@ pub struct FactEvent {
     pub provenance: String,
     /// Paths this fact governs. A `directional` or `north_star` fact scoped to a
     /// path demotes the weaker evidence found under it, which is how "we are
-    /// retiring wander/" outweighs wander/ having the most commits.
+    /// retiring monorepo/" outweighs monorepo/ having the most commits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub governs_paths: Vec<String>,
     /// Spans of code this fact is about. An `interface` or `exemplar` fact is
@@ -700,7 +700,7 @@ pub struct UnknownEvent {
     pub provenance: String,
     /// Paths this fact governs. A `directional` or `north_star` fact scoped to a
     /// path demotes the weaker evidence found under it, which is how "we are
-    /// retiring wander/" outweighs wander/ having the most commits.
+    /// retiring monorepo/" outweighs monorepo/ having the most commits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub governs_paths: Vec<String>,
     /// Spans of code this fact is about. An `interface` or `exemplar` fact is
@@ -911,9 +911,20 @@ impl FactEvent {
     }
 
     /// Sign in place: sets `signer` and `signature` and freezes the document.
+    /// Known secrets are masked first (`crate::secret_mask`), so a secret
+    /// never enters a signed record: once signed, the bytes cannot change.
     pub fn sign(&mut self, key: &PrivateKey) -> Result<(), ContractError> {
         self.raw = None;
-        let signed = key.sign_document("fact-event", &self.to_value())?;
+        let mut document = self.to_value();
+        if crate::secret_mask::mask_value(&mut document) {
+            *self = serde_json::from_value(document.clone()).map_err(|error| {
+                ContractError::internal(format!(
+                    "masked fact event no longer parses: {}",
+                    crate::json::serde_error_text(&error)
+                ))
+            })?;
+        }
+        let signed = key.sign_document("fact-event", &document)?;
         self.signer = signed["signer"].as_str().unwrap_or_default().to_owned();
         self.signature = signed["signature"].as_str().unwrap_or_default().to_owned();
         self.raw = Some(signed);
@@ -967,9 +978,19 @@ impl UnknownEvent {
         self.raw.clone().unwrap_or_else(|| self.to_value())
     }
 
+    /// Sign in place, known secrets masked first (see `FactEvent::sign`).
     pub fn sign(&mut self, key: &PrivateKey) -> Result<(), ContractError> {
         self.raw = None;
-        let signed = key.sign_document("unknown-event", &self.to_value())?;
+        let mut document = self.to_value();
+        if crate::secret_mask::mask_value(&mut document) {
+            *self = serde_json::from_value(document.clone()).map_err(|error| {
+                ContractError::internal(format!(
+                    "masked unknown event no longer parses: {}",
+                    crate::json::serde_error_text(&error)
+                ))
+            })?;
+        }
+        let signed = key.sign_document("unknown-event", &document)?;
         self.signer = signed["signer"].as_str().unwrap_or_default().to_owned();
         self.signature = signed["signature"].as_str().unwrap_or_default().to_owned();
         self.raw = Some(signed);

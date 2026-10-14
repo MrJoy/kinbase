@@ -26,7 +26,7 @@ pub const GIT_ATTRIBUTES: [&str; 2] = [
 /// Paths inside `.kin/` that belong to Kinbase.
 ///
 /// `config` is deliberately absent: that file is Kindex's, in YAML, and reserving it
-/// is what made Kinbase refuse to initialise in 87 of Wander's repositories. The two
+/// is what made Kinbase refuse to initialise in 87 repositories of one deployment. The two
 /// products share this directory by design, so each claims only its own names.
 pub const RESERVED_PATHS: [&str; 4] = [
     CONFIG_FILE,
@@ -303,7 +303,7 @@ pub fn git_ok(repo: &Path, args: &[&str]) -> bool {
 /// Kinbase's own config file inside `.kin/`.
 ///
 /// Kindex already owns `.kin/config`, in YAML, and 87 of the 159 repositories at
-/// Wander carry one. Both products are part of the same family and are meant to
+/// one deployment carry one. Both products are part of the same family and are meant to
 /// share the directory, so kinbase takes a distinct filename rather than fighting
 /// over a shared one -- reading a sibling product's YAML as a malformed kinbase
 /// config produced a quarantine error that told nobody what was actually wrong.

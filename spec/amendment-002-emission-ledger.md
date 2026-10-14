@@ -6,7 +6,7 @@ Status: **candidate, revision 3; not authority; no Coder dispatch permitted from
 
 This candidate adds one mechanism and rewrites two runbook steps so that the
 question a shared-data leak raises first, "what else got through?", is answered by a
-query rather than an investigation. It adopts the shape of Wander's Event service and
+query rather than an investigation. It adopts the shape of Example Corp's Event service and
 its story builders: a lossy observation path for notes, an acknowledged record path
 for the few facts whose loss would itself be a failure, a single-writer story builder
 that assembles related records into an addressable story with a disposition, and

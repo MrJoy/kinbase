@@ -30,12 +30,12 @@ explicit and adds the named form to cli.md.
 The single form is unchanged. The named form is mutually exclusive with it:
 
 ```toml
-[companies.wander]
+[companies.globex]
 url = "http://127.0.0.1:8421"
-facts_token_file = "/private/example/wander/facts.token"
-root_public_key_file = "/private/example/wander/company-root.pub"
-cache_root = "/private/example/wander/cache"
-discovery_hints = ["github.com/wandercom/*"]
+facts_token_file = "/private/example/globex/facts.token"
+root_public_key_file = "/private/example/globex/company-root.pub"
+cache_root = "/private/example/globex/cache"
+discovery_hints = ["github.com/globex/*"]
 
 [companies.acme]
 url = "http://127.0.0.1:8422"

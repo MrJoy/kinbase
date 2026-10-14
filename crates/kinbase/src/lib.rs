@@ -40,6 +40,7 @@ pub mod repository;
 pub mod sandbox;
 pub mod scanner;
 pub mod score;
+pub mod secret_mask;
 pub mod selection;
 pub mod session;
 pub mod store;

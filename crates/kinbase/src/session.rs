@@ -495,7 +495,18 @@ pub fn observe(
     let launcher = crate::launcher::Launcher::load()?;
     let registry = launcher.scanner_registry()?;
     let bytes = std::fs::read(event).map_err(io_error)?;
-    let parsed_records = parse_session_corpus(&bytes)?;
+    let mut parsed_records = parse_session_corpus(&bytes)?;
+    // Known secrets become `$NAME` before the text is digested, classified,
+    // stored or minted into a candidate (`crate::secret_mask`).
+    if let Some(table) = crate::secret_mask::active_table() {
+        for record in parsed_records.iter_mut() {
+            let mut value = Value::Object(std::mem::take(record));
+            crate::secret_mask::mask_value_with(&mut value, &table);
+            if let Value::Object(map) = value {
+                *record = map;
+            }
+        }
+    }
     // The session belongs to the host the batch names, not always Codex.
     let host = parsed_records
         .first()

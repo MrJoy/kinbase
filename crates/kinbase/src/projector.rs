@@ -210,7 +210,11 @@ pub fn run(
     as_of: &crate::time::AsOf,
     json: bool,
 ) -> Result<(), ContractError> {
-    let projection = project(launcher, repo, task, decision, working_set, evidence_repos, as_of)?;
+    let mut projection =
+        project(launcher, repo, task, decision, working_set, evidence_repos, as_of)?;
+    // The projection quotes facts and the task verbatim; known secrets are
+    // masked before it is printed (`crate::secret_mask`).
+    crate::secret_mask::mask_value(&mut projection.result);
     if json {
         println!("{}", crate::json::canonical_text(&projection.result));
     } else {
@@ -2045,6 +2049,56 @@ fn fold_control_characters(text: &str) -> String {
     out
 }
 
+/// The names a repository-level ruling (`ownership/repo/<name>`) calls its
+/// repository by: the key's leaf, and the leaf of each `org/repo` identity it
+/// governs. Uuids are governed too but are never what a sentence says.
+fn ruling_repository_names(fact: &CurrentFact) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(leaf) = fact.logical_key.strip_prefix("ownership/repo/") {
+        names.push(leaf.trim_matches('/').to_owned());
+    }
+    for governed in &fact.governs_paths {
+        let governed = governed.trim().trim_matches('/');
+        if let Some((_, leaf)) = governed.rsplit_once('/') {
+            names.push(leaf.to_owned());
+        }
+    }
+    names.retain(|name| !name.is_empty());
+    names
+}
+
+/// The repository a per-path ruling governs, as the ticket names it: the first
+/// segment of the governing prefix the ticket path matched (`legacy/src/x`
+/// names `legacy`). The ticket path's own leaf is a file name, never a
+/// repository, so it cannot stand in.
+fn prefix_repository_names(fact: &CurrentFact, path: &str) -> Vec<String> {
+    fact.governs_paths
+        .iter()
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .filter(|prefix| path.starts_with(prefix))
+        .filter_map(|prefix| prefix.split('/').find(|segment| !segment.is_empty()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `statement` says work moves "out of <name>", ignoring case, with
+/// `name` ending at a word boundary so `out of core` does not match
+/// `out of corenet`.
+fn names_out_of(statement: &str, name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let statement = statement.to_lowercase();
+    let needle = format!("out of {}", name.to_lowercase());
+    statement.match_indices(&needle).any(|(at, _)| {
+        statement[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| !(next.is_alphanumeric() || next == '_' || next == '-'))
+    })
+}
+
 /// The brief a projection carries above its selected facts.
 fn direction_brief(
     facts: &[CurrentFact],
@@ -2065,6 +2119,9 @@ fn direction_brief(
     // paths the ticket names. No fact is a reportable answer, not a guess.
     let paths = path_tokens(&question);
     let mut owners = Vec::new();
+    // Parallel to `owners`: the repository names each owner's governing
+    // prefix carries, kept out of the brief's JSON so its shape is unchanged.
+    let mut owner_names: Vec<Vec<String>> = Vec::new();
     for fact in company
         .iter()
         .filter(|f| f.logical_key.starts_with("ownership/") && !f.logical_key.starts_with("ownership/repo/"))
@@ -2076,6 +2133,7 @@ fn direction_brief(
                 .any(|prefix| path.starts_with(prefix.trim_end_matches('/')))
             {
                 owners.push(json!({"path": path, "row": direction_row(fact, as_of)}));
+                owner_names.push(prefix_repository_names(fact, path));
             }
         }
     }
@@ -2087,10 +2145,9 @@ fn direction_brief(
             && !repository_uuid.is_empty()
             && fact.governs_paths.iter().any(|g| g == repository_uuid)
     };
-    let repository_owner: Option<Value> = company
-        .iter()
-        .find(|f| governs_repository(f))
-        .map(|f| direction_row(f, as_of));
+    let repository_owner_fact: Option<&CurrentFact> =
+        company.iter().copied().find(|f| governs_repository(f));
+    let repository_owner: Option<Value> = repository_owner_fact.map(|f| direction_row(f, as_of));
     // Direction by ownership: an ownership fact cites the rows that justify
     // it (evidence_refs of the form `row:<logical key>`). Those rows govern
     // any ticket that touches the prefix, whatever words the ticket uses, so
@@ -2128,17 +2185,31 @@ fn direction_brief(
     // The words a ruling uses when the code in front of the agent is not
     // where the work belongs: the module is transitional, the monorepo is
     // retiring, landing here is for emergencies, work refactors out.
-    let retiring = |statement: &str| -> bool {
+    //
+    // One clause used to hard-code a particular company's name here — a proper
+    // noun in a live predicate, so the tool classified one deployment's rulings
+    // and nobody else's. Deleting it alone would have narrowed the behaviour for
+    // that deployment and widened it for none, because every surviving clause is
+    // a fixed English phrase. The generic form derives the phrase from the
+    // governing repository's OWN name, so "move it out of <repo>" is recognised
+    // for every deployment rather than for one.
+    let retiring = |statement: &str, repositories: &[String]| -> bool {
         statement.contains("transitional")
             || statement.contains("retir")
             || statement.contains("out of the monorepo")
-            || statement.contains("out of wander")
             || statement.contains("emergenc")
             || statement.contains("refactor out")
+            || repositories
+                .iter()
+                .any(|name| names_out_of(statement, name))
     };
-    if let Some(row) = &repository_owner {
+    if let (Some(row), Some(fact)) = (&repository_owner, repository_owner_fact) {
         let statement = row["statement"].as_str().unwrap_or_default();
-        if retiring(statement) {
+        // The repository's names come from the ruling itself: its logical key
+        // and the `org/repo` identities it governs. A row built by
+        // `direction_row` carries neither, which is why reading `subject` or
+        // `path` off the row left this clause unable to fire.
+        if retiring(statement, &ruling_repository_names(fact)) {
             questions.push(json!({
                 "kind": "ownership_conflict",
                 "path": "",
@@ -2151,9 +2222,9 @@ fn direction_brief(
             }));
         }
     }
-    for owner in &owners {
+    for (owner, names) in owners.iter().zip(&owner_names) {
         let statement = owner["row"]["statement"].as_str().unwrap_or_default();
-        if retiring(statement) {
+        if retiring(statement, names) {
             questions.push(json!({
                 "kind": "ownership_conflict",
                 "path": owner["path"],
@@ -2272,20 +2343,20 @@ mod brief_tests {
     fn a_repository_level_ruling_resolves_by_identity_and_delivers_its_rows() {
         let spec = company_fact(
             "architecture/delta-current-state-to-target/payment-spec-07",
-            "Delta — Payment — spec 07. wandercom/payment, largest and most mature.",
+            "Delta — Payment — spec 07. example/payment, largest and most mature.",
             &[],
             &[],
         );
         let owner = company_fact(
             "ownership/repo/payment",
-            "Target-state owner of wandercom/payment: Payment Service (spec 07). Status: live, refactoring.",
-            &["uuid-payment", "wandercom/payment"],
+            "Target-state owner of example/payment: Payment Service (spec 07). Status: live, refactoring.",
+            &["uuid-payment", "example/payment"],
             &["row:architecture/delta-current-state-to-target/payment-spec-07"],
         );
         let retiring = company_fact(
-            "ownership/repo/wander",
-            "Target-state owner of wandercom/wander: the retiring monorepo. Landing in wander/ is for emergencies only.",
-            &["uuid-wander", "wandercom/wander"],
+            "ownership/repo/monorepo",
+            "Target-state owner of example/monorepo: the retiring monorepo. Landing in monorepo/ is for emergencies only.",
+            &["uuid-monorepo", "example/monorepo"],
             &[],
         );
         let facts = vec![spec, owner, retiring];
@@ -2301,12 +2372,70 @@ mod brief_tests {
         assert_eq!(brief["target_state_owner"]["repository"]["logical_key"], "ownership/repo/payment");
         assert_eq!(brief["direction_by_ownership"][0]["logical_key"], "architecture/delta-current-state-to-target/payment-spec-07");
         assert!(brief["questions"].as_array().unwrap().is_empty());
-        let wander = direction_brief(&facts, &facts, "Fix a null check", "", "2026-09-13T00:00:00.000Z", "uuid-wander");
-        assert_eq!(wander["target_state_owner"]["status"], "resolved_repository");
-        assert_eq!(wander["questions"][0]["kind"], "ownership_conflict");
+        let monorepo = direction_brief(&facts, &facts, "Fix a null check", "", "2026-09-13T00:00:00.000Z", "uuid-monorepo");
+        assert_eq!(monorepo["target_state_owner"]["status"], "resolved_repository");
+        assert_eq!(monorepo["questions"][0]["kind"], "ownership_conflict");
         let nobody = direction_brief(&facts, &facts, "Fix a null check", "", "2026-09-13T00:00:00.000Z", "uuid-other");
         assert_eq!(nobody["target_state_owner"]["status"], "no_paths_named");
         assert!(nobody["target_state_owner"]["repository"].is_null());
+    }
+
+    /// A ruling that says only "out of <repo>" — none of the fixed English
+    /// phrases — must still raise the conflict, at both call sites. The first
+    /// generic form read the repository's name off the brief row (which carries
+    /// none) and off the ticket path's leaf (a file name), so this clause could
+    /// never fire.
+    #[test]
+    fn a_ruling_that_moves_work_out_of_its_named_repository_is_a_conflict() {
+        let repository = company_fact(
+            "ownership/repo/legacy-core",
+            "Target-state owner of example/legacy-core: the Platform Service. New work moves out of legacy-core.",
+            &["uuid-legacy", "example/legacy-core"],
+            &[],
+        );
+        let billing = company_fact(
+            "ownership/legacy-core-billing",
+            "Billing moves out of legacy-core into the Payment Service.",
+            &["legacy-core/src/billing"],
+            &[],
+        );
+        let facts = vec![repository, billing];
+
+        let by_repository = direction_brief(
+            &facts,
+            &facts,
+            "Fix a null check",
+            "",
+            "2026-09-13T00:00:00.000Z",
+            "uuid-legacy",
+        );
+        let questions = by_repository["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert_eq!(questions[0]["kind"], "ownership_conflict");
+        assert_eq!(questions[0]["owner_row"], "ownership/repo/legacy-core");
+
+        let by_path = direction_brief(
+            &facts,
+            &facts,
+            "Fix rounding in legacy-core/src/billing/invoice.ts",
+            "",
+            "2026-09-13T00:00:00.000Z",
+            "",
+        );
+        let questions = by_path["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert_eq!(questions[0]["path"], "legacy-core/src/billing/invoice.ts");
+        assert_eq!(questions[0]["owner_row"], "ownership/legacy-core-billing");
+
+        // A longer name sharing the prefix is a different repository.
+        assert!(!super::names_out_of(
+            "Work moves out of legacy-core2.",
+            "legacy-core"
+        ));
+        assert!(super::names_out_of(
+            "Work moves Out Of Legacy-Core/ soon.",
+            "legacy-core"
+        ));
     }
 
     #[test]
@@ -2360,7 +2489,7 @@ mod brief_tests {
         );
         let live = company_fact(
             "architecture/delta-current-state-to-target/payment-spec-07",
-            "Delta — Payment — spec 07. wandercom/payment, largest and most mature.",
+            "Delta — Payment — spec 07. example/payment, largest and most mature.",
             &[],
             &[],
         );

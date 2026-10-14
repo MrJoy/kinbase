@@ -554,6 +554,79 @@ fn one_failing_candidate_does_not_end_the_checkpoint() {
 }
 
 #[test]
+fn a_later_stop_counts_an_admitted_candidate_instead_of_admitting_it_again() {
+    // Every Stop used to admit every automatic candidate of the session again
+    // and list each receipt in its checkpoint, so checkpoints grew with the
+    // session and the ledger with its square.
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let session = "host-session-13";
+    let canonical = kinbase::json::canonical_text(&json!({
+        "destination": "personal",
+        "atom_kind": "constraint",
+        "scope": "host-session",
+        "statement": "Retries stop after five attempts."
+    }));
+    fs::write(
+        world.personal.join("candidates.jsonl"),
+        format!(
+            "{}\n",
+            kinbase::json::canonical_text(&json!({
+                "candidate_id": "cand_c",
+                "session_id": session,
+                "admission_mode": "automatic",
+                "destination": "personal",
+                "principal": "principal-a",
+                "canonical": canonical,
+                "payload_digest": kinbase::hash::sha256_text(&canonical),
+                "confidence": 8000
+            }))
+        ),
+    )
+    .expect("candidates");
+    let stop = json!({
+        "session_id": session,
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "Stop",
+        "stop_hook_active": false
+    });
+    let dispatch = || {
+        ok(&kinbase(
+            &world,
+            &["hooks", "dispatch", "claude", "Stop", "--json"],
+            &[],
+            stop.to_string().as_bytes(),
+        ))
+    };
+
+    let first = dispatch();
+    assert_eq!(first["admissions"][0]["candidate_id"], "cand_c", "{first}");
+    assert_eq!(first["admissions"][0]["state"], "committed", "{first}");
+    assert_eq!(first["admissions_settled"], 0, "{first}");
+    let decisions = fs::read_to_string(world.personal.join("proposal-decisions.jsonl"))
+        .expect("the admission is decided");
+
+    let second = dispatch();
+    // The host still recovers the session's receipts from its Stop (V-9
+    // parity): the settled receipt is returned unchanged, only not recorded.
+    assert_eq!(second["admissions"], first["admissions"], "{second}");
+    assert_eq!(second["admissions_settled"], 1, "{second}");
+    assert_eq!(second["admission_failures"], 0, "{second}");
+    assert_eq!(second["checkpointed"], true, "{second}");
+    assert_eq!(
+        fs::read_to_string(world.personal.join("proposal-decisions.jsonl")).expect("decisions"),
+        decisions,
+        "nothing is decided twice"
+    );
+    let checkpoints =
+        fs::read_to_string(world.personal.join("session-checkpoints.jsonl")).expect("checkpoints");
+    let lines: Vec<&str> = checkpoints.lines().collect();
+    assert_eq!(lines.len(), 2, "{checkpoints}");
+    assert!(lines[0].contains("\"candidate_id\":\"cand_c\""));
+    assert!(!lines[1].contains("cand_c"), "{}", lines[1]);
+}
+
+#[test]
 fn a_precompact_checkpoints_the_session_and_allows_the_compaction() {
     let temp = TempDir::new().expect("tempdir");
     let world = world(&temp);

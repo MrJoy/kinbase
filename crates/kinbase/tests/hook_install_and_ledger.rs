@@ -835,3 +835,105 @@ fn plan_refuses_a_host_outside_the_configured_range() {
         String::from_utf8_lossy(&planned.stderr)
     );
 }
+
+#[test]
+fn session_end_does_not_read_the_checkpoint_ledger() {
+    use std::io::{Read as _, Seek as _};
+    let temp = TempDir::new().expect("tempdir");
+    let world = host_world(&temp);
+    // A sparse 64 GiB ledger costs no disk, but reading it through takes far
+    // longer than the host's 1.5 s SessionEnd budget. Only a checkpoint that
+    // never scans the ledger finishes in time.
+    let ledger_path = world.personal.join("session-checkpoints.jsonl");
+    let ledger = fs::File::create(&ledger_path).expect("ledger");
+    fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o600)).expect("chmod ledger");
+    let size = 64u64 << 30;
+    // A filesystem without sparse files would allocate all 64 GiB; measure
+    // free space rather than st_blocks, which some (gVisor) report as the
+    // full length even for a hole.
+    let free = || {
+        let path =
+            std::ffi::CString::new(world.personal.as_os_str().as_encoded_bytes()).expect("path");
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::statvfs(path.as_ptr(), &mut stat) },
+            0,
+            "statvfs"
+        );
+        stat.f_bavail as u64 * stat.f_frsize as u64
+    };
+    let free_before = free();
+    ledger
+        .set_len(size)
+        .expect("sparse ledger (this filesystem may not support sparse files)");
+    let consumed = free_before.saturating_sub(free());
+    assert!(
+        consumed < 1 << 30,
+        "this filesystem does not support sparse files: the 64 GiB ledger consumed {consumed} bytes"
+    );
+    // A complete last line, so the checkpoint takes the plain append path
+    // rather than the torn-tail repair.
+    {
+        use std::os::unix::fs::FileExt as _;
+        ledger.write_at(b"\n", size - 1).expect("terminate ledger");
+    }
+    drop(ledger);
+    let envelope = json!({
+        "session_id": "host-session-end",
+        "hook_event_name": "SessionEnd",
+        "reason": "exit",
+        "transcript_path": "/nonexistent/transcript.jsonl",
+        "cwd": world.repo.display().to_string()
+    });
+    let stderr_path = temp.path().join("session-end.stderr");
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kinbase"))
+        .current_dir(&world.repo)
+        .args(["hooks", "dispatch", "claude", "SessionEnd", "--json"])
+        .env("HOME", &world.home)
+        .env("XDG_CONFIG_HOME", &world.config_home)
+        .env("XDG_STATE_HOME", world.home.join(".state"))
+        .env_remove("KINBASE_COMPANY_URL")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&stderr_path).expect("stderr file"))
+        .spawn_alone()
+        .expect("spawn dispatch");
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin
+            .write_all(envelope.to_string().as_bytes())
+            .expect("write stdin");
+    }
+    let budget = std::time::Duration::from_millis(1500);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if started.elapsed() > budget {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "SessionEnd still running after {budget:?}: {}",
+                fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "SessionEnd refused ({status}): {}",
+        fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
+    // The checkpoint still landed at the end of the ledger, as its own line.
+    let mut file = fs::File::open(&ledger_path).expect("reopen ledger");
+    file.seek(std::io::SeekFrom::Start(size)).expect("seek");
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).expect("tail");
+    assert!(tail.starts_with('{'), "{tail}");
+    assert!(
+        tail.contains("\"session_id\":\"host-session-end\""),
+        "{tail}"
+    );
+}

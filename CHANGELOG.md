@@ -13,3 +13,11 @@ Notable changes to Kinbase. Dates are UTC.
   Fact and Unknown events) and before hook, projection, explain and other command
   output is printed. Off unless configured; a repository's config cannot set or
   weaken it. See README, "Masking known secrets".
+
+### Fixed
+
+- Directories Kinbase creates now take the mode of the directory they are created
+  in, and files never grant group or other access their directory withholds. The
+  Personal store's event shard directories were created 0755 and its events 0644
+  under a 0700 root; they are now 0700 and 0600. Existing stores keep their modes
+  until tightened by hand.

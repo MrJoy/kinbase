@@ -4,7 +4,7 @@
 
 use crate::error::ContractError;
 use std::fs;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 /// `<hex-0:2>/<hex-2:4>/<remaining-60-hex>.json` from a verified digest.
@@ -113,7 +113,7 @@ pub fn reject_symlink(path: &Path, role: &str) -> Result<(), ContractError> {
 pub fn ensure_private_dir(path: &Path, role: &str) -> Result<(), ContractError> {
     reject_symlink(path, role)?;
     if !path.exists() {
-        fs::create_dir_all(path).map_err(|error| {
+        create_dirs_like_parent(path).map_err(|error| {
             ContractError::refused(
                 "CONFIG_INVARIANT",
                 format!("{role} directory cannot be created ({})", error.kind()),
@@ -147,7 +147,33 @@ pub fn ensure_private_dir(path: &Path, role: &str) -> Result<(), ContractError> 
 
 pub fn ensure_dir(path: &Path, role: &str) -> Result<(), ContractError> {
     reject_symlink(path, role)?;
-    fs::create_dir_all(path).map_err(|error| ContractError::io(&format!("create {role}"), error))
+    create_dirs_like_parent(path)
+        .map_err(|error| ContractError::io(&format!("create {role}"), error))
+}
+
+/// `create_dir_all`, except each directory it creates takes the mode of the
+/// nearest one that already exists rather than the process umask's. A shard
+/// directory inside the Personal store (0700) used to be created 0755.
+fn create_dirs_like_parent(path: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    while !existing.is_dir() {
+        missing.push(existing);
+        match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
+            _ => return fs::create_dir_all(path),
+        }
+    }
+    let mode = fs::metadata(existing)?.permissions().mode() & 0o777;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(mode);
+    for directory in missing.into_iter().rev() {
+        match builder.create(directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            result => result?,
+        }
+    }
+    Ok(())
 }
 
 /// Durable atomic write: temp file in the same directory, fsync, rename,
@@ -162,7 +188,14 @@ pub fn write_atomic(
     let parent = path
         .parent()
         .ok_or_else(|| ContractError::internal("atomic write target has no parent"))?;
-    fs::create_dir_all(parent).map_err(|error| ContractError::io("create parent", error))?;
+    create_dirs_like_parent(parent).map_err(|error| ContractError::io("create parent", error))?;
+    // A file never grants group or other access its directory withholds: an
+    // event written 0644 into the Personal store lands 0600.
+    let directory_mode = fs::metadata(parent)
+        .map_err(|error| ContractError::io("read parent", error))?
+        .permissions()
+        .mode();
+    let mode = mode & (0o700 | (directory_mode & 0o077));
     if immutable && path.exists() {
         let existing = fs::read(path).map_err(|error| ContractError::io("read existing", error))?;
         if existing == bytes {
@@ -339,4 +372,61 @@ pub fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"))
         .join("kinbase")
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn what_is_created_under_a_private_directory_stays_private() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("personal");
+        ensure_private_dir(&root, "test store").expect("root");
+        assert_eq!(mode(&root), 0o700, "precondition: a private root");
+
+        // An event store's shard directories, then the event itself.
+        let shard = root.join("events").join("7a").join("ee");
+        ensure_dir(&shard, "event store").expect("shard");
+        let event = shard.join("event.json");
+        write_atomic(&event, b"{}", 0o644, true).expect("event");
+        // A write whose parents do not exist yet.
+        let body = root.join("bodies").join("ab").join("body");
+        write_atomic(&body, b"body", 0o600, false).expect("body");
+
+        for created in [
+            root.join("events"),
+            root.join("events").join("7a"),
+            shard.clone(),
+            root.join("bodies"),
+            root.join("bodies").join("ab"),
+        ] {
+            assert_eq!(mode(&created), 0o700, "{}", created.display());
+        }
+        assert_eq!(mode(&event), 0o600);
+        assert_eq!(mode(&body), 0o600);
+    }
+
+    #[test]
+    fn what_is_created_under_a_shared_directory_is_no_more_open_than_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("kin");
+        fs::create_dir(&root).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).expect("chmod");
+        let event = root.join("events").join("7a").join("event.json");
+        write_atomic(&event, b"{}", 0o644, true).expect("event");
+        // The umask can only narrow these further.
+        assert_eq!(mode(&root.join("events")) & !0o750, 0);
+        assert_eq!(mode(&root.join("events").join("7a")) & !0o750, 0);
+        assert_eq!(mode(&event) & !0o640, 0);
+        assert_eq!(
+            mode(&event) & 0o600,
+            0o600,
+            "the owner keeps read and write"
+        );
+    }
 }

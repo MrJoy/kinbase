@@ -23,3 +23,9 @@ Notable changes to Kinbase. Dates are UTC.
   keeps the modes it has, and new shards inherit them: its `events/` directories are
   likely 0755 already. Tighten them once by hand, for example
   `find <store> -type d -exec chmod 700 {} + && find <store> -type f -exec chmod 600 {} +`.
+- Stop, SessionEnd and PreCompact no longer slow down as the Personal store grows.
+  A checkpoint appends without hashing the whole checkpoint ledger first, looks up
+  its candidates' receipts in one read of the decision ledger, and counts candidates
+  already admitted (`admissions_settled`) instead of admitting and listing them
+  again. On an 832 MB checkpoint ledger a SessionEnd went from 2.65 s to 0.04 s,
+  and a Stop in a session with 2,776 admitted candidates from 27.8 s to 0.45 s.

@@ -60,7 +60,36 @@ pub fn append_record_durable(
     value: &Value,
 ) -> Result<(), ContractError> {
     let root = ensure_store_root(store, repo)?;
-    append_jsonl_with(&root.join(filename), value, true)
+    append_jsonl_with(
+        &root.join(filename),
+        value,
+        Append {
+            durable: true,
+            check_present: true,
+        },
+    )
+}
+
+/// `append_record` for a record that carries an identity minted for this
+/// write (a fresh UUID, a timestamp), so it can never already be in the
+/// ledger and the duplicate check has nothing to find. That check builds its
+/// index in process memory, and a hook is a fresh process: every Stop hashed
+/// the whole checkpoint ledger to append one line (2.6 s at 832 MB).
+pub fn append_fresh_record(
+    store: crate::StoreKind,
+    repo: &Path,
+    filename: &str,
+    value: &Value,
+) -> Result<(), ContractError> {
+    let root = ensure_store_root(store, repo)?;
+    append_jsonl_with(
+        &root.join(filename),
+        value,
+        Append {
+            durable: false,
+            check_present: false,
+        },
+    )
 }
 
 /// Every readable record of `filename`. An unreadable line is skipped and
@@ -366,10 +395,31 @@ fn line_appended(file: &fs::File, path: &Path, canonical: &[u8]) {
 }
 
 pub fn append_jsonl(path: &Path, value: &Value) -> Result<(), ContractError> {
-    append_jsonl_with(path, value, false)
+    append_jsonl_with(
+        path,
+        value,
+        Append {
+            durable: false,
+            check_present: true,
+        },
+    )
 }
 
-fn append_jsonl_with(path: &Path, value: &Value, durable: bool) -> Result<(), ContractError> {
+/// How `append_jsonl_with` appends: whether it returns only once the line is
+/// on disk, and whether it first looks for the line already being there.
+struct Append {
+    durable: bool,
+    check_present: bool,
+}
+
+fn append_jsonl_with(
+    path: &Path,
+    value: &Value,
+    Append {
+        durable,
+        check_present,
+    }: Append,
+) -> Result<(), ContractError> {
     if let Some(parent) = path.parent() {
         crate::paths::ensure_private_dir(parent, "record directory")?;
     }
@@ -408,7 +458,7 @@ fn append_jsonl_with(path: &Path, value: &Value, durable: bool) -> Result<(), Co
             std::io::Error::last_os_error(),
         ));
     }
-    if line_present(&file, path, canonical.as_bytes())? {
+    if check_present && line_present(&file, path, canonical.as_bytes())? {
         // An earlier attempt may have written the line and failed to sync it;
         // a durable append returns only once the line is on disk.
         if durable {

@@ -1200,3 +1200,27 @@ fn a_refused_evidence_repository_is_refused_even_beside_an_unselected_one() {
         text(&output)
     );
 }
+
+#[test]
+fn a_company_is_not_issued_a_repository_another_companys_hint_claims() {
+    let world = World::new();
+    let repo = world.repo("alpha-hinted", "git@github.com:alpha-org/hinted.git");
+    // `repo init` would count alpha's hint beside beta's certificate and
+    // refuse it, so beta must not be issued one.
+    let refused = world.kinbase(
+        &repo,
+        &["repo", "issue", "--repo", ".", "--company", BETA, "--json"],
+    );
+    assert_eq!(refused.status.code(), Some(4), "issue: {}", text(&refused));
+    assert!(
+        text(&refused).contains("company-ambiguous"),
+        "{}",
+        text(&refused)
+    );
+    assert!(!repo.join(".kin/kinbase.toml").exists());
+    // The Company the hint names is issued one, and it installs.
+    world.certify(&repo, ALPHA);
+    let (code, status) = world.status(&repo);
+    assert_eq!(code, Some(0), "status: {status}");
+    assert_eq!(status["company_selection"]["outcome"]["selected"], ALPHA);
+}

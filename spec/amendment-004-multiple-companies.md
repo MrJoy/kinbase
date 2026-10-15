@@ -80,7 +80,9 @@ discovery_hints = ["github.com/acme-corp/*", "gitlab.acme.example/platform/**"]
 - `S-05` Selection grants no trust. The selected Company's build_trust still checks
   signature, pins, revocation and freshness, and fails closed as today.
 - `S-06` `repo issue --company <name>` refuses `certified-elsewhere` when another
-  configured Company holds or pins the repository.
+  configured Company holds or pins the repository, and `company-ambiguous` when
+  another Company's `discovery_hints` match its origin: S-03 would refuse to install
+  the certificate it issued.
 
 ## 3. Hosts and sessions
 

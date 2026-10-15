@@ -227,6 +227,31 @@ pub fn resolve(user: &UserConfig, target: &Target) -> (Outcome, Evidence) {
                     evidence,
                 );
             }
+            // `repo init` counts every hint beside the certificate (S-03), so
+            // a certificate issued past another Company's hint would only be
+            // refused when installed.
+            let hinted: Vec<String> = evidence
+                .hint_matches
+                .iter()
+                .filter(|other| *other != name)
+                .cloned()
+                .collect();
+            if !hinted.is_empty() {
+                return (
+                    Outcome::Refused(Refusal {
+                        reason: "company-ambiguous",
+                        message: format!(
+                            "the discovery hints of Company {} match this repository's origin",
+                            quoted(&hinted)
+                        ),
+                        remediation: format!(
+                            "If this repository belongs to Company `{name}`, narrow the other Company's discovery_hints in the user config so they no longer match its origin, then issue again."
+                        ),
+                        detail: json!({"reason": "company-ambiguous", "evidence": evidence.to_value()}),
+                    }),
+                    evidence,
+                );
+            }
             (checked(user, name, "named"), evidence)
         }
         Target::Install { repo, certificate } => {

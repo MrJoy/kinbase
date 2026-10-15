@@ -131,20 +131,6 @@ impl Launcher {
         }
     }
 
-    /// Whether a single-form revocation watermark for `(revoked_key, cursor)`
-    /// belongs to the Company selected here: it does only when this
-    /// Company's snapshot is the one configured snapshot carrying that
-    /// revocation (`selection::revocation_holders`).
-    pub fn owns_legacy_watermark(&self, revoked_key: &str, cursor: &str) -> bool {
-        let (Some(user), crate::selection::Outcome::Selected { name, .. }) =
-            (self.user.as_ref(), &self.selection)
-        else {
-            return false;
-        };
-        crate::selection::revocation_holders(&user.companies, revoked_key, cursor)
-            .is_some_and(|holders| holders.len() == 1 && &holders[0] == name)
-    }
-
     /// Several Companies are configured (`[companies.<name>]`).
     pub fn named_form(&self) -> bool {
         self.user

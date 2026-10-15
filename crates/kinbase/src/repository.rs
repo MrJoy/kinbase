@@ -1605,8 +1605,8 @@ pub fn trust_facts(
             // A revocation cursor is one Company's counter. With several
             // Companies the key carries the company_id, so one maintainer key
             // revoked by two of them at the same cursor keeps two first
-            // sightings; the unqualified key a converted single-form config
-            // recorded still answers first, so converting reopens nothing.
+            // sightings. Converting a single-form config starts fresh ones
+            // (`revocation_watermark`).
             let scope = launcher.company_key_scope();
             // Under several Companies a missing company_id is not the single
             // form: the unqualified keys are shared by every Company, so no
@@ -1618,39 +1618,13 @@ pub fn trust_facts(
             };
             for (revoked_key, cursor, _) in revocations {
                 let revocation = Revocation::of_key(revoked_key, cursor, String::new());
-                let legacy = format!(
-                    "revocation-watermark:{}:{}",
-                    revocation.revoked_key, revocation.cursor
+                let watermark = revocation_watermark(
+                    &private,
+                    scope.as_deref(),
+                    &revocation.revoked_key,
+                    &revocation.cursor,
+                    now_cursor,
                 );
-                let key = match &scope {
-                    Some(company_id) => format!(
-                        "revocation-watermark:{company_id}:{}:{}",
-                        revocation.revoked_key, revocation.cursor
-                    ),
-                    None => legacy.clone(),
-                };
-                // A converted single-form watermark carries over only to the
-                // Company it provably belongs to; any doubt starts a fresh one,
-                // which reopens more, never less.
-                let recorded = private.meta(&key).ok().flatten().or_else(|| {
-                    scope.as_ref()?;
-                    let carried = private.meta(&legacy).ok().flatten()?;
-                    if !launcher.owns_legacy_watermark(&revocation.revoked_key, &revocation.cursor)
-                    {
-                        return None;
-                    }
-                    // Idempotent: every process that gets here computed the
-                    // same owner and writes the same value.
-                    let _ = private.set_meta(&key, &carried);
-                    Some(carried)
-                });
-                let watermark = match recorded {
-                    Some(text) => text.parse::<u64>().unwrap_or(now_cursor),
-                    None => {
-                        let _ = private.set_meta(&key, &now_cursor.to_string());
-                        now_cursor
-                    }
-                };
                 let entry = facts
                     .revocation_watermarks
                     .entry(revocation.revoked_key.clone())
@@ -1664,6 +1638,34 @@ pub fn trust_facts(
         }
     }
     facts
+}
+
+/// The ledger cursor at which this client first observed the revocation
+/// `(revoked_key, cursor)`, recording `now_cursor` the first time. `scope` is
+/// the selected Company's company_id under the named form.
+///
+/// A watermark the single form recorded names no Company, and nothing on
+/// this machine proves which Company recorded it: a cached snapshot that
+/// lacks the revocation may just be stale. So no Company adopts it. Each
+/// starts a fresh watermark, which reopens more history, never less.
+fn revocation_watermark(
+    private: &crate::private::PrivateStore,
+    scope: Option<&str>,
+    revoked_key: &str,
+    cursor: &str,
+    now_cursor: u64,
+) -> u64 {
+    let key = match scope {
+        Some(company_id) => format!("revocation-watermark:{company_id}:{revoked_key}:{cursor}"),
+        None => format!("revocation-watermark:{revoked_key}:{cursor}"),
+    };
+    match private.meta(&key).ok().flatten() {
+        Some(text) => text.parse::<u64>().unwrap_or(now_cursor),
+        None => {
+            let _ = private.set_meta(&key, &now_cursor.to_string());
+            now_cursor
+        }
+    }
 }
 
 /// Replay the proof clock recorded at repository creation, advanced by this
@@ -4856,6 +4858,39 @@ mod packet10_repository_tests {
         assert_eq!(
             event_path_origin_class(Path::new("."), relative, &tracked, &dirty, "merged-default"),
             "uncommitted-worktree"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revocation_watermark_tests {
+    use super::revocation_watermark;
+    use crate::private::PrivateStore;
+
+    #[test]
+    fn a_single_form_watermark_is_never_adopted_by_a_company() {
+        // The single form's watermark names no Company, and a cached snapshot
+        // can be stale, so no evidence here proves which Company recorded it.
+        // Adopting it lowers that Company's first sighting, and observations
+        // admitted in between would not reopen.
+        let temp = tempfile::TempDir::new().unwrap();
+        let private = PrivateStore::open_personal(&temp.path().join("personal")).unwrap();
+        private
+            .set_meta("revocation-watermark:key:1001", "42")
+            .unwrap();
+        assert_eq!(
+            revocation_watermark(&private, Some("cid-a"), "key", "1001", 50),
+            50
+        );
+        // The first sighting is recorded once, then kept.
+        assert_eq!(
+            revocation_watermark(&private, Some("cid-a"), "key", "1001", 60),
+            50
+        );
+        // The single form still reads its own watermark.
+        assert_eq!(
+            revocation_watermark(&private, None, "key", "1001", 60),
+            42
         );
     }
 }

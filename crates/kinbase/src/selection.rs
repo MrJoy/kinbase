@@ -499,44 +499,6 @@ fn present(path: &Path) -> Result<bool, ()> {
     }
 }
 
-/// Which configured Companies' verified snapshots carry the revocation
-/// `(revoked_key, cursor)`; `None` when any Company's cache has no snapshot
-/// or cannot be read, because then the answer is not knowable here.
-///
-/// A revocation watermark recorded under the single form carries no Company.
-/// It belongs to the one Company whose snapshot carries that revocation, and
-/// the answer is the same whichever Company's invocation asks and in
-/// whatever order, so attributing it needs no claim and no lock.
-pub fn revocation_holders(
-    companies: &[NamedCompany],
-    revoked_key: &str,
-    cursor: &str,
-) -> Option<Vec<String>> {
-    let mut holders = Vec::new();
-    for company in companies {
-        let snapshot = cached_snapshot(&company.config.cache_root)?;
-        let carries = ["revocation_history", "revocations"].iter().any(|field| {
-            snapshot
-                .get(*field)
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("revoked_key")
-                            .and_then(Value::as_str)
-                            .map(PublicKey::canonical_spelling)
-                            .as_deref()
-                            == Some(revoked_key)
-                            && item.get("cursor").and_then(Value::as_str) == Some(cursor)
-                    })
-                })
-        });
-        if carries {
-            holders.push(company.name.clone());
-        }
-    }
-    Some(holders)
-}
-
 fn cached_snapshot(cache_root: &Path) -> Option<Value> {
     let path = cache_root.join(crate::company::cache::CACHE_FILE);
     let connection = rusqlite::Connection::open_with_flags(
@@ -707,78 +669,7 @@ fn replace_word(text: &str, needle: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_company_id, replace_bound_destinations, replace_word, revocation_holders};
-    use crate::config::{CompanyConfig, NamedCompany};
-    use std::path::Path;
-
-    fn company(
-        name: &str,
-        cache_root: &Path,
-        revocations: Option<&[(&str, &str)]>,
-    ) -> NamedCompany {
-        std::fs::create_dir_all(cache_root).unwrap();
-        if let Some(revocations) = revocations {
-            let connection =
-                rusqlite::Connection::open(cache_root.join(crate::company::cache::CACHE_FILE))
-                    .unwrap();
-            connection
-                .execute_batch("CREATE TABLE snapshot(id INTEGER PRIMARY KEY, bytes BLOB, digest TEXT, stored_at TEXT);")
-                .unwrap();
-            let history: Vec<serde_json::Value> = revocations
-                .iter()
-                .map(|(key, cursor)| serde_json::json!({"revoked_key": key, "cursor": cursor, "effective_at": "x"}))
-                .collect();
-            let bytes =
-                serde_json::to_vec(&serde_json::json!({"revocation_history": history})).unwrap();
-            connection
-                .execute(
-                    "INSERT INTO snapshot(id, bytes, digest, stored_at) VALUES (1, ?1, '', '')",
-                    [bytes],
-                )
-                .unwrap();
-        }
-        NamedCompany {
-            name: name.to_owned(),
-            discovery_hints: Vec::new(),
-            config: CompanyConfig {
-                url: String::new(),
-                facts_token_file: cache_root.join("facts"),
-                root_public_key_file: cache_root.join("root"),
-                cache_root: cache_root.to_path_buf(),
-                admin_token_file: None,
-                directory_token_file: None,
-                authority_token_file: None,
-                client_key_file: cache_root.join("client"),
-                maintainer_key_file: cache_root.join("maintainer"),
-                allow_non_loopback: false,
-            },
-            client_key_defaulted: false,
-            maintainer_key_defaulted: false,
-        }
-    }
-
-    #[test]
-    fn a_legacy_watermark_belongs_only_to_the_company_whose_snapshot_carries_it() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let key = "ab".repeat(32);
-        let a = company("a", &temp.path().join("a"), Some(&[(key.as_str(), "7")]));
-        let b = company("b", &temp.path().join("b"), Some(&[(key.as_str(), "9")]));
-        let companies = [a.clone(), b.clone()];
-        // Only `a` carries (key, 7): the answer is `a`, whoever asks.
-        assert_eq!(
-            revocation_holders(&companies, &key, "7"),
-            Some(vec!["a".to_owned()])
-        );
-        // Both carry (key, 9) once `a` revokes at 9 too: no single owner.
-        let a9 = company("a", &temp.path().join("a9"), Some(&[(key.as_str(), "9")]));
-        assert_eq!(
-            revocation_holders(&[a9, b.clone()], &key, "9").map(|holders| holders.len()),
-            Some(2)
-        );
-        // A Company with no snapshot yet makes the answer unknowable.
-        let cold = company("c", &temp.path().join("c"), None);
-        assert_eq!(revocation_holders(&[a, b, cold], &key, "7"), None);
-    }
+    use super::{cached_company_id, replace_bound_destinations, replace_word};
 
     #[test]
     fn a_snapshot_whose_meta_rows_were_lost_still_names_its_company() {

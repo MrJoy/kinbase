@@ -365,6 +365,17 @@ fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
         Command::Session(SessionCommand::End { session }) => {
             crate::session::end(&session, json).map_err(internal)?;
         }
+        Command::Session(SessionCommand::AbandonFanout {
+            repo,
+            destination,
+            candidates,
+            apply,
+        }) => {
+            let repo = repo
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            crate::session::abandon_fanouts(&repo, &destination, &candidates, apply, json)
+                .map_err(internal)?;
+        }
         Command::Questions(command) => {
             crate::questions::dispatch(command, json).map_err(internal)?;
         }

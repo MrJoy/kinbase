@@ -3968,6 +3968,164 @@ pub fn inflight_journal_state(repo_root: &Path) -> Value {
     json!(markers)
 }
 
+/// The receipt error an abandoned fan-out settles with.
+const FANOUT_ABANDONED: &str = "FANOUT_ABANDONED";
+
+/// Settle this repository's unfinished fan-outs to one Company destination as
+/// refused, so `recover_fanout_journal` stops retrying them on every
+/// admission. This is for an event Company will never commit -- one parked in
+/// its steward queue that no steward is going to admit -- and is the admitting
+/// principal's call, not Company's: the queued event stays where it is, and a
+/// later steward admission does not reopen the fan-out.
+///
+/// Without `apply` it only reports what it would settle. `candidates` narrows
+/// it to those ids; empty means every unfinished fan-out to `destination`.
+pub fn abandon_fanouts(
+    repo_root: &Path,
+    destination: &str,
+    candidates: &[String],
+    apply: bool,
+    json: bool,
+) -> Result<(), ContractError> {
+    if !destination.starts_with("company") {
+        return Err(ContractError::refused(
+            "AUTHORITY_SCOPE_DENIED",
+            "only a Company fan-out can be abandoned",
+            "Name a company destination, e.g. company:<id>.",
+        ));
+    }
+    let repository = crate::codebase::Repository::discover(repo_root)?;
+    let repository_uuid = crate::repository::repository_id(repo_root)?;
+    let root = repository.local_dir().join("journal").join("fanout");
+    let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(&root) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(ContractError::io("read fan-out journal", error)),
+    };
+    entries.sort();
+    // Read once, as recovery does, and only if some fan-out is unfinished.
+    let mut records: Option<std::collections::HashMap<String, Value>> = None;
+    let mut settled = Vec::new();
+    for dir in entries {
+        let candidate_id = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !candidates.is_empty() && !candidates.contains(&candidate_id) {
+            continue;
+        }
+        let journal = FanoutJournal {
+            dir: dir.clone(),
+            candidate_id: candidate_id.clone(),
+            destination: destination.to_owned(),
+        };
+        if journal.is_done() {
+            continue;
+        }
+        let records = records.get_or_insert_with(|| {
+            let mut by_id = std::collections::HashMap::new();
+            for record in personal_records("candidates.jsonl") {
+                if let Some(id) = crate::json::get_str(&record, "candidate_id") {
+                    by_id.entry(id.to_owned()).or_insert(record);
+                }
+            }
+            by_id
+        });
+        let Some(record) = records.get(&candidate_id) else {
+            continue;
+        };
+        if crate::json::get_str(record, "destination") != Some(destination) {
+            continue;
+        }
+        let reservation = journal.read("nonce_reservation");
+        let prior = journal.read("receipt");
+        let receipt_id = prior
+            .as_ref()
+            .and_then(|marker| crate::json::get_str(marker, "receipt_id"))
+            .or_else(|| {
+                reservation
+                    .as_ref()
+                    .and_then(|marker| crate::json::get_str(marker, "receipt_id"))
+            })
+            .unwrap_or_default()
+            .to_owned();
+        let payload_digest = reservation
+            .as_ref()
+            .and_then(|marker| crate::json::get_str(marker, "payload_digest"))
+            .unwrap_or_default()
+            .to_owned();
+        let prior_state = prior
+            .as_ref()
+            .and_then(|marker| crate::json::get_str(marker, "state"))
+            .unwrap_or("none")
+            .to_owned();
+        if apply {
+            let attempt = json!({
+                "error_code": FANOUT_ABANDONED,
+                "error_message": "abandoned by the admitting principal; Company never committed it",
+                "retryable": false,
+                "abandoned_from": prior_state
+            });
+            let apology_ids = prior
+                .as_ref()
+                .and_then(|marker| marker.get("apology_ids").cloned())
+                .unwrap_or_else(|| json!([]));
+            let base_receipt = json!({
+                "candidate_id": candidate_id,
+                "destination": destination,
+                "decision": "admit",
+                "digest": payload_digest,
+                "decided_at": now_rfc3339_millis(),
+                "receipt_id": receipt_id,
+                "state": "pending",
+                "recovered": true
+            });
+            let _generation = repository.admission_lock(&repository_uuid)?;
+            journal.begin("receipt", json!({}))?;
+            let marker = journal.complete(
+                "receipt",
+                json!({
+                    "state": "refused",
+                    "attempt": attempt,
+                    "apology_ids": apology_ids,
+                    "receipt_id": receipt_id
+                }),
+            )?;
+            let summary = receipt_from_marker(&marker, &receipt_id);
+            finalize_principal_receipt(&base_receipt, &summary)?;
+            journal.finish()?;
+        }
+        settled.push(json!({
+            "candidate_id": candidate_id,
+            "receipt_id": receipt_id,
+            "prior_state": prior_state
+        }));
+    }
+    let report = json!({
+        "status": if apply { "abandoned" } else { "dry-run" },
+        "destination": destination,
+        "fanouts": settled
+    });
+    if json {
+        println!("{}", serde_json::to_string(&report).unwrap_or_default());
+    } else {
+        let verb = if apply { "abandoned" } else { "would abandon" };
+        println!("{verb} {} fan-out(s) to {destination}", settled.len());
+        for row in &settled {
+            println!(
+                "  {} ({})",
+                crate::json::get_str(row, "candidate_id").unwrap_or_default(),
+                crate::json::get_str(row, "prior_state").unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// This repository's apologies still awaiting reconcile/abandon (the orphans
 /// that are not yet terminally closed). The Personal store holds every
 /// repository's.

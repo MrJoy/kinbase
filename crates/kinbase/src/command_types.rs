@@ -189,6 +189,21 @@ pub enum SessionCommand {
     End {
         session: String,
     },
+    /// Settle unfinished fan-outs to a Company destination as refused, so
+    /// recovery stops retrying an event Company will never commit.
+    AbandonFanout {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// The Company destination, e.g. `company:<id>`.
+        #[arg(long)]
+        destination: String,
+        /// Only these candidates (repeatable); default every unfinished one.
+        #[arg(long = "candidate")]
+        candidates: Vec<String>,
+        /// Write the receipts; without it, only report what would change.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

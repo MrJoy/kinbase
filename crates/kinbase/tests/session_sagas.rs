@@ -5,6 +5,8 @@
 //! - `status` closes only its own repository's overdue apologies, writes the
 //!   terminal event at the repository root, and the orphaned claim is
 //!   withdrawn by the reducer.
+//! - `session abandon-fanout` settles only the named Company destination's
+//!   unfinished fan-outs as refused, and only with `--apply`.
 
 mod support;
 
@@ -422,4 +424,158 @@ fn status_closes_only_its_own_overdue_apologies_at_the_repository_root() {
         .filter(|event| event["disposition"] == "orphan_abandoned")
         .count();
     assert_eq!(terminal, 1);
+}
+
+fn abandon_fanout(world: &Certified, destination: &str, apply: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kinbase"));
+    command
+        .current_dir(&world.repo)
+        .args(["session", "abandon-fanout", "--json", "--repo"])
+        .arg(&world.repo)
+        .args(["--destination", destination])
+        .env("HOME", &world.home)
+        .env("XDG_CONFIG_HOME", &world.config_home)
+        .env_remove("KINBASE_COMPANY_URL");
+    if apply {
+        command.arg("--apply");
+    }
+    command
+        .output_alone()
+        .expect("run kinbase session abandon-fanout")
+}
+
+/// A fan-out journal as a Company retry that came back pending leaves it.
+fn plant_fanout(world: &Certified, candidate: &str, destination: &str, done: bool) {
+    let dir = world.repo.join(".kin/local/journal/fanout").join(candidate);
+    let marker = |transition: &str, state: &str, extra: Value| {
+        let mut marker = json!({
+            "schema": "kinbase-fanout-journal/1",
+            "candidate_id": candidate,
+            "destination": destination,
+            "transition": transition,
+            "journal_state": state,
+            "updated_at": "2026-10-17T03:52:55.000Z"
+        });
+        if let (Value::Object(target), Value::Object(source)) = (&mut marker, extra) {
+            target.extend(source);
+        }
+        private_write(
+            &dir.join(format!("{transition}.json")),
+            kinbase::json::canonical_text(&marker).as_bytes(),
+        );
+    };
+    marker(
+        "nonce_reservation",
+        "nonce_reserved",
+        json!({"receipt_id": format!("receipt_{candidate}"), "payload_digest": format!("digest_{candidate}")}),
+    );
+    marker(
+        "receipt",
+        "receipt_written",
+        json!({"state": "pending", "receipt_id": format!("receipt_{candidate}"), "apology_ids": ["apology_kept"]}),
+    );
+    if done {
+        marker("done", "done", json!({}));
+    }
+}
+
+fn decisions(world: &Certified) -> Vec<Value> {
+    fs::read_to_string(world.personal.join("proposal-decisions.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("decision"))
+        .collect()
+}
+
+#[test]
+fn abandon_fanout_settles_only_the_named_company_destination() {
+    let world = certified();
+    let stuck = "company:company-test";
+    private_write(
+        &world.personal.join("candidates.jsonl"),
+        &jsonl(&[
+            json!({"candidate_id": "cand_stuck", "destination": stuck}),
+            json!({"candidate_id": "cand_other", "destination": "company:elsewhere"}),
+            json!({"candidate_id": "cand_finished", "destination": stuck}),
+        ]),
+    );
+    plant_fanout(&world, "cand_stuck", stuck, false);
+    plant_fanout(&world, "cand_other", "company:elsewhere", false);
+    plant_fanout(&world, "cand_finished", stuck, true);
+    let journal = world.repo.join(".kin/local/journal/fanout");
+
+    // A dry run reports and writes nothing.
+    let dry = abandon_fanout(&world, stuck, false);
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let report: Value = serde_json::from_slice(&dry.stdout).expect("dry-run JSON");
+    assert_eq!(report["status"], "dry-run");
+    assert_eq!(
+        report["fanouts"],
+        json!([{"candidate_id": "cand_stuck", "receipt_id": "receipt_cand_stuck", "prior_state": "pending"}])
+    );
+    assert!(!journal.join("cand_stuck/done.json").exists());
+    assert!(decisions(&world).is_empty());
+
+    let applied = abandon_fanout(&world, stuck, true);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let report: Value = serde_json::from_slice(&applied.stdout).expect("apply JSON");
+    assert_eq!(report["status"], "abandoned");
+    assert_eq!(report["fanouts"].as_array().map(Vec::len), Some(1));
+
+    let read = |path: PathBuf| -> Value {
+        serde_json::from_slice(&fs::read(path).expect("marker")).expect("marker JSON")
+    };
+    assert_eq!(
+        read(journal.join("cand_stuck/done.json"))["journal_state"],
+        "done"
+    );
+    let receipt = read(journal.join("cand_stuck/receipt.json"));
+    assert_eq!(receipt["state"], "refused");
+    assert_eq!(receipt["attempt"]["error_code"], "FANOUT_ABANDONED");
+    assert_eq!(receipt["apology_ids"], json!(["apology_kept"]));
+    // The other destination's fan-out is untouched.
+    assert!(!journal.join("cand_other/done.json").exists());
+    assert_eq!(
+        read(journal.join("cand_other/receipt.json"))["state"],
+        "pending"
+    );
+
+    let settled = decisions(&world);
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0]["candidate_id"], "cand_stuck");
+    assert_eq!(settled[0]["receipt_id"], "receipt_cand_stuck");
+    assert_eq!(settled[0]["digest"], "digest_cand_stuck");
+    assert_eq!(settled[0]["state"], "refused");
+    assert_eq!(settled[0]["error_code"], "FANOUT_ABANDONED");
+
+    // A second run finds nothing left to settle.
+    let again = abandon_fanout(&world, stuck, true);
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let report: Value = serde_json::from_slice(&again.stdout).expect("rerun JSON");
+    assert_eq!(report["fanouts"], json!([]));
+    assert_eq!(decisions(&world).len(), 1);
+}
+
+#[test]
+fn abandon_fanout_refuses_a_non_company_destination() {
+    let world = certified();
+    let output = abandon_fanout(&world, &format!("codebase:{REPOSITORY}"), true);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("only a Company fan-out"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

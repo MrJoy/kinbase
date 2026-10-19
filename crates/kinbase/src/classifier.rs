@@ -1232,27 +1232,58 @@ fn is_nonfact_statement(text: &str) -> bool {
         || lower.contains("for now")
 }
 
+/// Organization-wide ownership, not the mere mention of a topic (the routing
+/// instruction's own test). A phrase claims the ownership by itself; a topic
+/// word claims it only right after an organization word, so "company
+/// governance" is Company while "the governance guard" is not.
 fn is_company_statement(lower: &str) -> bool {
-    [
+    const OWNERSHIP_PHRASES: [&str; 11] = [
         "architecture decision",
         "architecture direction",
         "chief architect",
-        "company policy",
-        "organization",
         "company-wide",
-        "corporate",
+        "organization-wide",
+        "org-wide",
         "product policy",
-        "standard",
-        "governance",
-        "roadmap",
         "company decision",
         "all teams",
         "every team",
         "named authority",
+    ];
+    // Whole words, never substrings: "incorporate" is not "corporate".
+    const ORGANIZATION_WORDS: [&str; 5] = [
+        "company",
+        "corporate",
+        "organization",
+        "organisation",
+        "org",
+    ];
+    const TOPIC_WORDS: [&str; 9] = [
+        "policy",
+        "policies",
+        "standard",
+        "standards",
+        "governance",
+        "roadmap",
+        "roadmaps",
         "steward",
-    ]
-    .iter()
-    .any(|token| lower.contains(token))
+        "stewards",
+    ];
+    if OWNERSHIP_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        return true;
+    }
+    // Adjacent means separated by whitespace alone: in "`organization`,
+    // `roadmap`" the two words are list items, not a modifier and its noun.
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    words.windows(2).any(|pair| {
+        let modifier = pair[0].trim_start_matches(|c: char| !c.is_alphanumeric());
+        let modifier = modifier.strip_suffix("'s").unwrap_or(modifier);
+        let topic = pair[1].trim_end_matches(|c: char| !c.is_alphanumeric());
+        ORGANIZATION_WORDS.contains(&modifier) && TOPIC_WORDS.contains(&topic)
+    })
 }
 
 fn is_codebase_statement(lower: &str) -> bool {
@@ -1999,6 +2030,50 @@ mod tests {
                     .and_then(Value::as_str)
                     .unwrap()
                     .starts_with("atom_")
+            );
+        }
+    }
+
+    #[test]
+    fn a_topic_word_alone_does_not_claim_company_ownership() {
+        // Session fragments the bare-substring match sent to a Company
+        // steward queue (#41).
+        let mentions = [
+            "The governance guard blocks the rules-file edit.",
+            "[standard · T1, T3, T41; /validate Phase B/C] Per-requirement oracle and falsifier",
+            "Unused-member/localization/delivery bookkeeping surfaces are Standard.",
+            "It is a plain substring match on tokens such as `standard`, `governance`, `organization`, `roadmap` and `steward`.",
+            "Personal-session fragments then reach the steward-owned Company store.",
+            "We need to understand the organization of this module.",
+            "Please incorporate while preserving independent test evidence.",
+        ];
+        for text in mentions {
+            assert!(
+                !is_company_statement(&text.to_lowercase()),
+                "a mention claimed Company ownership: {text}"
+            );
+            let map = json!({"observation_id": "obs", "source_kind": "claude_jsonl"});
+            let atom = atom_from_observation_base(map.as_object().unwrap(), text, "high");
+            assert_ne!(
+                atom["proposed_destinations"],
+                json!(["company"]),
+                "a mention was routed to Company: {text}"
+            );
+        }
+        let claims = [
+            "The organization roadmap prioritizes safety.",
+            "Company governance owns this release policy.",
+            "The company's standards require signed releases.",
+            "The company steward rules on cross-team exceptions.",
+            "Organization-wide, retention is owned by the architecture authority.",
+            "Every team must follow the architecture standard.",
+            "The corporate standard defines review authority.",
+            "The company policy requires signed releases.",
+        ];
+        for text in claims {
+            assert!(
+                is_company_statement(&text.to_lowercase()),
+                "an ownership claim was not Company: {text}"
             );
         }
     }

@@ -4,6 +4,15 @@ Notable changes to Kinbase. Dates are UTC.
 
 ## Unreleased
 
+### Fixed
+
+- Shared admissions no longer slow down as a repository's finished fan-out
+  sagas accumulate. Recovery read every saga's `done.json` on every admission;
+  a saga seen finished is now listed in `.kin/local/journal/fanout-finished`
+  and skipped by name, and `status` skips it too. The first admission after
+  upgrade reads each finished saga once more. Journal directories stay where
+  they are.
+
 ## 0.1.2 - 2026-10-30
 
 ### Fixed

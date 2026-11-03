@@ -4,13 +4,14 @@
 //! wrong Host/Origin/content type, and internal errors.
 
 use super::db::CompanyDb;
+use super::reduction::{lifecycle_authorized, lifecycle_targets};
 use super::trust::{self, TrustState};
 use crate::config::ServiceConfig;
 use crate::crypto::{PrivateKey, PublicKey};
 use crate::error::ContractError;
 use crate::http::{self, Request};
 use crate::model::{CurrentFact, FactEvent};
-use crate::reducer::{AdmittedEvent, ReducerInput, Verification};
+use crate::reducer::Verification;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{TcpListener, TcpStream};
@@ -60,10 +61,62 @@ impl Drop for ConnectionSlot {
     }
 }
 
+/// Snapshots assembled at once. A warm snapshot still materializes the facts,
+/// their JSON and a signed copy (a few hundred MiB at a large store), and the
+/// connection ceiling alone let eight overlapping refreshes take one service to
+/// 3 GiB. Beyond this a refresh is refused, not queued: it keeps its cached
+/// snapshot and asks again rather than holding memory in line.
+pub const MAX_CONCURRENT_SNAPSHOTS: usize = 2;
+
+/// The refusal past [`MAX_CONCURRENT_SNAPSHOTS`]. `LIMIT_EXCEEDED` is ratified
+/// as conditionally retryable (spec/cli.md error contract), and this ceiling
+/// clears as soon as an assembly finishes, so it is marked retryable: the
+/// client keeps its cached snapshot and asks again shortly.
+fn snapshot_ceiling_refusal() -> ContractError {
+    ContractError::new(
+        "LIMIT_EXCEEDED",
+        "the service is already assembling its ceiling of concurrent snapshots",
+        "Retry shortly; the cached snapshot stays in use meanwhile and nothing was truncated silently.",
+        true,
+        crate::error::ExitCode::Refused,
+    )
+    .with_detail(json!({"refused_count": 1, "omitted_count": 1, "ceiling": MAX_CONCURRENT_SNAPSHOTS}))
+}
+
+/// The places under [`MAX_CONCURRENT_SNAPSHOTS`].
+#[derive(Default)]
+pub struct SnapshotSlots(AtomicUsize);
+
+/// One place, given back on drop so an early return or panic cannot leak it.
+pub struct SnapshotSlot<'a>(&'a AtomicUsize);
+
+impl SnapshotSlots {
+    /// `None` when every place is taken; the count rises in one
+    /// compare-and-set, so two requests cannot both claim the last place.
+    pub fn acquire(&self) -> Option<SnapshotSlot<'_>> {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < MAX_CONCURRENT_SNAPSHOTS).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| SnapshotSlot(&self.0))
+    }
+}
+
+impl Drop for SnapshotSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct ServiceState {
     pub config: ServiceConfig,
     pub root: PrivateKey,
     pub started_at: String,
+    /// The reduced Company view, shared across connections.
+    pub views: super::view_cache::ViewCache,
+    /// Snapshot assemblies in flight.
+    pub snapshots: SnapshotSlots,
 }
 
 type Handled = Result<(u16, Value), (u16, ContractError)>;
@@ -229,6 +282,8 @@ pub fn serve(
         config,
         root,
         started_at: crate::time::now_rfc3339_millis(),
+        views: Default::default(),
+        snapshots: Default::default(),
     });
     let banner = json!({
         "status": "company-serving",
@@ -308,8 +363,9 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) {
     // Rendering the refusal happens inside the guard as well: a panic there
     // closed the connection with no response at all, which the client
     // reports as an outage.
+    let mut usage = None;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match handle(&state, &request) {
+        match handle(&state, &request, &mut usage) {
             Ok(answer) => answer,
             Err((status, error)) => (status, http::error_body(&error)),
         }
@@ -325,9 +381,41 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) {
         )
     });
     let _ = http::respond(&mut stream, status, &body);
+    // The caller has its answer before the usage row is written. Written
+    // first, a row queued behind another request's write lock held a
+    // committed answer back, and a client that timed out and retried with a
+    // fresh nonce had its fact admitted twice.
+    drop(stream);
+    if let Some(usage) = usage {
+        usage.write();
+    }
 }
 
-fn handle(state: &ServiceState, request: &Request) -> Handled {
+/// How long a usage row waits for the write lock before it is dropped.
+const USAGE_LOCK_WAIT: Duration = Duration::from_millis(100);
+
+/// A usage row held until the request's answer is on the wire, with the
+/// connection that will write it.
+struct PendingUsage {
+    db: CompanyDb,
+    event: crate::usage::UsageEvent,
+}
+
+impl PendingUsage {
+    /// A busy store costs the row, reported by `usage::record`, rather than
+    /// holding this worker and its connection slot for the ten seconds every
+    /// other write waits.
+    fn write(self) {
+        let _ = self.db.connection.busy_timeout(USAGE_LOCK_WAIT);
+        crate::usage::record(&self.db, &self.event);
+    }
+}
+
+/// Answer one request. An authenticated request that got past the rate
+/// ceiling leaves its usage row in `usage`, for the caller to write once the
+/// answer has gone out.
+fn handle(state: &ServiceState, request: &Request, usage: &mut Option<PendingUsage>) -> Handled {
+    let started = std::time::Instant::now();
     let host = request.header("host").unwrap_or_default();
     // A Host that must be loopback is a DNS-rebinding guard for a service on the
     // operator's own machine. On a non-loopback bind the Host is the Service
@@ -377,6 +465,7 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
     if route == "/status"
         && request.method == "GET"
         && request.header("authorization").is_none()
+        && request.header("x-kinbase-token").is_none()
         && request.header("x-kinbase-signature").is_none()
     {
         // Unauthenticated status is refused like every other read.
@@ -385,43 +474,85 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
         return Err(auth_refusal());
     }
     let auth = authenticate(&db, state, request, &now)?;
+    // Usage is recorded for authenticated requests under the rate ceiling
+    // only. A refusal before authentication has no principal to attribute
+    // it to and is already counted per subject by the auth-failure throttle;
+    // writing a row for it would hand every peer that can reach the port one
+    // SQLite write per connect. A request over the ceiling is likewise
+    // counted by the rate table it was refused from, and a row for it let a
+    // token holder past the limit grow the usage table until the disk filled.
+    enforce_request_rate(&db, state, &auth)?;
+    let mut action = crate::usage::classify(&request.method, &route, None);
+    let answer = handle_authenticated(&db, state, request, &auth, &route, &now, &mut action);
+    if state.config.record_usage {
+        let (status, error_code) = match &answer {
+            Ok((status, _)) => (*status, None),
+            Err((status, error)) => (*status, Some(error.code.clone())),
+        };
+        let event = crate::usage::UsageEvent {
+            recorded_at: now,
+            principal_id: auth.token.principal_id.clone(),
+            client: auth.client_key.chars().take(16).collect(),
+            token_role: auth.token.role.clone(),
+            action: action.name,
+            target: action.target,
+            status,
+            error_code,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        *usage = Some(PendingUsage { db, event });
+    }
+    answer
+}
+
+/// Everything an authenticated request does. `action` starts as the route's
+/// classification and is refined once the body is parsed.
+fn handle_authenticated(
+    db: &CompanyDb,
+    state: &ServiceState,
+    request: &Request,
+    auth: &AuthContext,
+    route: &str,
+    now: &str,
+    action: &mut crate::usage::Action,
+) -> Handled {
+    let parsed_body = if request.body.is_empty() {
+        Ok(None)
+    } else {
+        crate::json::parse_strict_value(&request.body).map(Some)
+    };
+    // Classified before maintenance can refuse: a supersession that met a
+    // maintenance failure was otherwise recorded as a new fact.
+    if let Ok(body) = &parsed_body {
+        *action = crate::usage::classify(&request.method, route, body.as_ref());
+    }
     // Periodic obligations run behind authentication, never in front of it.
     // They prune nonces, retire lapsed manifest observations and sign
     // fact-events with the Company root key; running them on arrival meant an
     // unauthenticated peer drove SQLite writes and root-key signatures by
     // connecting, which on a routable bind is anyone who can reach the port.
-    maintenance(&db, state, &now).map_err(|error| refuse(500, error))?;
-    let parsed_body: Option<Value> = if request.body.is_empty() {
-        None
-    } else {
-        Some(
-            crate::json::parse_strict_value(&request.body).map_err(|error| {
-                refuse(
-                    400,
-                    ContractError::invariant(format!(
-                        "body is not canonical strict JSON ({error})"
-                    )),
-                )
-            })?,
+    maintenance(db, state, now).map_err(|error| refuse(500, error))?;
+    let parsed_body: Option<Value> = parsed_body.map_err(|error| {
+        refuse(
+            400,
+            ContractError::invariant(format!("body is not canonical strict JSON ({error})")),
         )
-    };
-    let trust_state = trust::load(&db, &state.root.public()).map_err(|error| refuse(500, error))?;
-    match (request.method.as_str(), route.as_str()) {
-        ("GET", "/status") => status(&db, state, &auth, &trust_state),
-        ("GET", "/facts") => facts(&db, state, &auth, &trust_state, request, &now),
-        ("POST", "/facts") => admit_fact(&db, state, &auth, &trust_state, parsed_body, &now),
-        ("GET", "/snapshot") => snapshot(&db, state, &auth, &trust_state, request, &now),
-        ("GET", "/events") => events(&db, state, &auth, &trust_state, request),
+    })?;
+    let trust_state = trust::load(db, &state.root.public()).map_err(|error| refuse(500, error))?;
+    match (request.method.as_str(), route) {
+        ("GET", "/status") => status(db, state, auth, &trust_state),
+        ("GET", "/facts") => facts(db, state, auth, &trust_state, request, now),
+        ("POST", "/facts") => admit_fact(db, state, auth, &trust_state, parsed_body, now),
+        ("GET", "/snapshot") => snapshot(db, state, auth, &trust_state, request, now),
+        ("GET", "/events") => events(db, state, auth, &trust_state, request),
         ("POST", "/authority-registry") => {
-            publish_registry(&db, &auth, &trust_state, parsed_body, &now)
+            publish_registry(db, auth, &trust_state, parsed_body, now)
         }
-        ("GET", "/authority-registry") => authority_registry(&db, &auth),
-        ("POST", "/directory") => {
-            directory_write(&db, state, &auth, &trust_state, parsed_body, &now)
-        }
-        ("POST", "/questions") => post_question(&db, state, &auth, &trust_state, parsed_body, &now),
+        ("GET", "/authority-registry") => authority_registry(db, auth),
+        ("POST", "/directory") => directory_write(db, state, auth, &trust_state, parsed_body, now),
+        ("POST", "/questions") => post_question(db, state, auth, &trust_state, parsed_body, now),
         ("GET", "/questions") => {
-            require_scope(&auth, "facts:read")?;
+            require_scope(auth, "facts:read")?;
             let questions = db
                 .questions(request.query.get("authority_id").map(String::as_str))
                 .map_err(|error| refuse(500, error))?;
@@ -430,9 +561,9 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
                 json!({"questions": questions, "count": questions.len()}),
             ))
         }
-        ("POST", "/answers") => post_answer(&db, state, &auth, &trust_state, parsed_body, &now),
+        ("POST", "/answers") => post_answer(db, state, auth, &trust_state, parsed_body, now),
         ("GET", "/answers") => {
-            require_scope(&auth, "facts:read")?;
+            require_scope(auth, "facts:read")?;
             let question_id = request
                 .query
                 .get("question_id")
@@ -443,19 +574,19 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
                 .map_err(|error| refuse(500, error))?;
             Ok((200, json!({"answers": answers})))
         }
-        ("POST", "/unknowns") => post_unknown(&db, &auth, &trust_state, parsed_body, &now),
+        ("POST", "/unknowns") => post_unknown(db, auth, &trust_state, parsed_body, now),
         ("GET", "/unknowns") => {
-            require_scope(&auth, "facts:read")?;
+            require_scope(auth, "facts:read")?;
             let unknowns = db
                 .unknowns(request.query.get("status").map(String::as_str))
                 .map_err(|error| refuse(500, error))?;
             Ok((200, json!({"unknowns": unknowns})))
         }
         ("POST", "/certificates") => {
-            issue_certificate(&db, state, &auth, &trust_state, parsed_body, &now)
+            issue_certificate(db, state, auth, &trust_state, parsed_body, now)
         }
         ("GET", "/certificates") => {
-            require_scope(&auth, "facts:read")?;
+            require_scope(auth, "facts:read")?;
             let hint = request.query.get("hint").cloned().unwrap_or_default();
             let certificates = if hint.is_empty() {
                 db.all_certificates().map_err(|error| refuse(500, error))?
@@ -465,36 +596,36 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
             };
             Ok((200, json!({"certificates": certificates})))
         }
-        ("POST", "/manifests") => post_manifest(&db, &auth, &trust_state, parsed_body, &now),
+        ("POST", "/manifests") => post_manifest(db, auth, &trust_state, parsed_body, now),
         ("POST", "/revocations") => steward_event(
-            &db,
-            &auth,
+            db,
+            auth,
             &trust_state,
             parsed_body,
             "revocation",
             "revocation",
-            &now,
+            now,
         ),
-        ("GET", "/revocations") => revocations(&db, &auth),
+        ("GET", "/revocations") => revocations(db, auth),
         ("POST", "/rotations") => steward_event(
-            &db,
-            &auth,
+            db,
+            auth,
             &trust_state,
             parsed_body,
             "rotation",
             "rotation",
-            &now,
+            now,
         ),
-        ("POST", "/tokens") => issue_token(&db, &auth, parsed_body, &now),
+        ("POST", "/tokens") => issue_token(db, auth, parsed_body, now),
         ("GET", "/steward-queue") => {
-            require_scope(&auth, "admin:issue")?;
+            require_scope(auth, "admin:issue")?;
             Ok((
                 200,
                 json!({"queue": db.steward_queue().map_err(|error| refuse(500, error))?}),
             ))
         }
         ("GET", path) if path.starts_with("/questions/") => {
-            require_scope(&auth, "facts:read")?;
+            require_scope(auth, "facts:read")?;
             let id = path.trim_start_matches("/questions/");
             match db.question(id).map_err(|error| refuse(500, error))? {
                 Some(mut question) => {
@@ -508,9 +639,9 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
             }
         }
         ("GET", path) if path.starts_with("/directory/") => {
-            require_scope(&auth, "directory:read")?;
+            require_scope(auth, "directory:read")?;
             let id = path.trim_start_matches("/directory/");
-            match db.directory(id, &now).map_err(|error| refuse(500, error))? {
+            match db.directory(id, now).map_err(|error| refuse(500, error))? {
                 Some(entry) => Ok((200, entry)),
                 None => Err(refuse(
                     404,
@@ -519,7 +650,7 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
             }
         }
         ("GET", path) if path.starts_with("/certificates/") => {
-            require_scope(&auth, "facts:read")?;
+            require_scope(auth, "facts:read")?;
             let id = path.trim_start_matches("/certificates/");
             match db.certificate(id).map_err(|error| refuse(500, error))? {
                 // Hand back exactly what was signed; the read-time annotations
@@ -532,7 +663,7 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
             }
         }
         ("GET", path) if path.starts_with("/manifests/") => {
-            require_scope(&auth, "facts:read")?;
+            require_scope(auth, "facts:read")?;
             let id = path.trim_start_matches("/manifests/");
             let branch = request
                 .query
@@ -553,7 +684,7 @@ fn handle(state: &ServiceState, request: &Request) -> Handled {
             }
         }
         ("GET", path) if path.starts_with("/facts/") => {
-            fact_detail(&db, state, &auth, &trust_state, path, request, &now)
+            fact_detail(db, state, auth, &trust_state, path, request, now)
         }
         _ => Err(refuse(404, ContractError::invariant("no such endpoint"))),
     }
@@ -591,11 +722,13 @@ fn authenticate(
 ) -> Result<AuthContext, (u16, ContractError)> {
     let minute = now_minute();
     let bearer = request
-        .header("authorization")
-        .and_then(|value| {
-            value
-                .strip_prefix("Bearer ")
-                .or_else(|| value.strip_prefix("bearer "))
+        .header("x-kinbase-token")
+        .or_else(|| {
+            request.header("authorization").and_then(|value| {
+                value
+                    .strip_prefix("Bearer ")
+                    .or_else(|| value.strip_prefix("bearer "))
+            })
         })
         .map(str::trim)
         .filter(|token| !token.is_empty());
@@ -716,8 +849,22 @@ fn authenticate(
     }
     db.record_token_client_pair(&token.digest, &client_hex, now)
         .map_err(|error| refuse(500, error))?;
+    Ok(AuthContext {
+        principal_key: format!("{}:{}", token.principal_id, &client_hex[..16]),
+        token,
+        client_key: client_hex,
+    })
+}
+
+/// The per-client-key request ceiling, checked once the credential is known
+/// and before `handle` keeps a usage row: a refusal here writes none.
+fn enforce_request_rate(
+    db: &CompanyDb,
+    state: &ServiceState,
+    auth: &AuthContext,
+) -> Result<(), (u16, ContractError)> {
     let rate = db
-        .bump_request_rate(&client_hex, minute)
+        .bump_request_rate(&auth.client_key, now_minute())
         .map_err(|error| refuse(500, error))?;
     if rate > state.config.requests_per_minute {
         return Err(refuse(
@@ -728,11 +875,7 @@ fn authenticate(
             ),
         ));
     }
-    Ok(AuthContext {
-        principal_key: format!("{}:{}", token.principal_id, &client_hex[..16]),
-        token,
-        client_key: client_hex,
-    })
+    Ok(())
 }
 
 fn require_scope(auth: &AuthContext, scope: &str) -> Result<(), (u16, ContractError)> {
@@ -801,181 +944,25 @@ fn charge_read(
     Ok(())
 }
 
-/// Reduce the Company event log into the current view.
-pub fn current_view(
-    db: &CompanyDb,
-    trust_state: &TrustState,
-    as_of: &str,
-) -> Result<crate::reducer::CurrentView, ContractError> {
-    let mut admitted = Vec::new();
-    let mut tombstones = Vec::new();
-    for (cursor, payload, verification) in db.events_of_kind("fact-event")? {
-        let Ok(event) = FactEvent::from_value(&payload) else {
-            continue;
-        };
-        let verification = match verification.as_str() {
-            "verified" => Verification::Verified,
-            "wrong-scope" => Verification::WrongScope,
-            "revoked" => Verification::Revoked,
-            "signature-invalid" => Verification::SignatureInvalid,
-            _ => Verification::Unverified,
-        };
-        if let Some(action) = crate::model::action_of(&event) {
-            if matches!(action, "misextraction" | "never_true" | "support_withdrawn") {
-                let targets = lifecycle_targets(db, &event);
-                let (authorized, _) = lifecycle_authorized(trust_state, &event, action, &targets);
-                for target in event.parents.iter().chain(event.supersedes.iter()) {
-                    tombstones.push(crate::reducer::Tombstone {
-                        kind: action.to_owned(),
-                        target_event_id: target.clone(),
-                        signer_authorized: verification == Verification::Verified && authorized,
-                        reason_code: event.statement.clone(),
-                        tombstone_id: event.event_id.clone(),
-                    });
-                }
-                continue;
-            }
-        }
-        let signer = event.signer.clone();
-        admitted.push(AdmittedEvent {
-            event,
-            verification,
-            store_cursor: cursor.to_string(),
-            origin_trust: None,
-            reachable: None,
-            source_identity: Some(signer),
-            environment_registered: None,
-        });
-    }
-    let mut unknowns = Vec::new();
-    for (_, payload, _) in db.events_of_kind("unknown-event")? {
-        if let Ok(unknown) = crate::model::UnknownEvent::from_value(&payload) {
-            unknowns.push(unknown);
-        }
-    }
-    let input = ReducerInput {
-        store_kind: "company".to_owned(),
-        events: admitted,
-        unknowns,
-        tombstones,
-        revocations: trust_state.observed_revocations(),
-        as_of: as_of.to_owned(),
-        authority_cursor: trust_state.cursor.to_string(),
-        revocation_fresh: true,
-        fact_valid_until: None,
-        certificate_valid: true,
-        authority_owner_by_scope: trust_state.authority_owner_by_scope(),
-        steward_authority_id: trust_state.steward_authority_id(),
-    };
-    Ok(crate::reducer::reduce(&input))
-}
-
-/// Resolve the events a lifecycle action names (parents and supersedes) to
-/// `(event_id, logical_key, authority_scope)` from the admitted log.
-fn lifecycle_targets(db: &CompanyDb, event: &FactEvent) -> Vec<(String, String, String)> {
-    let named: Vec<&String> = event
-        .parents
-        .iter()
-        .chain(event.supersedes.iter())
-        .collect();
-    if named.is_empty() {
-        return Vec::new();
-    }
-    let mut targets = Vec::new();
-    for (_, payload, _) in db.events_of_kind("fact-event").unwrap_or_default() {
-        let event_id = crate::json::get_str(&payload, "event_id").unwrap_or_default();
-        let fact_id = crate::json::get_str(&payload, "fact_id").unwrap_or_default();
-        if named
-            .iter()
-            .any(|id| id.as_str() == event_id || id.as_str() == fact_id)
-        {
-            targets.push((
-                event_id.to_owned(),
-                crate::json::get_str(&payload, "logical_key")
-                    .unwrap_or_default()
-                    .to_owned(),
-                crate::json::get_str(&payload, "authority_scope")
-                    .unwrap_or_default()
-                    .to_owned(),
-            ));
-        }
-    }
-    targets
-}
-
-/// Whether the signer of a lifecycle action holds the authority the action
-/// requires. `misextraction` is an approver-owned claim about bytes versus
-/// evidence, so any verified signer may issue it; `never_true` and
-/// `support_withdrawn` are semantic withdrawals reserved for the Company
-/// steward or the registered owner of the withdrawn fact's exact scope.
-fn lifecycle_authorized(
-    trust_state: &TrustState,
-    event: &FactEvent,
-    action: &str,
-    targets: &[(String, String, String)],
-) -> (bool, Option<String>) {
-    let target_scope = targets.first().map(|(_, _, scope)| scope.clone());
-    if action == "misextraction" {
-        return (true, target_scope);
-    }
-    if trust_state.is_steward(&event.signer) {
-        return (true, target_scope);
-    }
-    let Some(scope) = target_scope.clone() else {
-        return (false, None);
-    };
-    let owns_scope = trust_state
-        .entries_for_key(&event.signer)
-        .iter()
-        .any(|entry| crate::json::get_str(entry, "scope") == Some(scope.as_str()));
-    (owns_scope, target_scope)
-}
-
 /// Lifecycle admissions and refusals as the Company records them: admitted
 /// withdrawal events (with the authority outcome the reducer applied) plus
 /// audited refusals, so a client can report who was allowed to withdraw what.
+/// A reader sees a row when it may read the withdrawing event's scope or the
+/// scope of the fact it withdrew.
 fn lifecycle_admissions(
     db: &CompanyDb,
-    trust_state: &TrustState,
+    event_rows: &[Value],
     readable: &BTreeSet<String>,
 ) -> Vec<Value> {
-    let mut rows = Vec::new();
-    for (cursor, payload, verification) in db.events_of_kind("fact-event").unwrap_or_default() {
-        let Ok(event) = FactEvent::from_value(&payload) else {
-            continue;
-        };
-        let Some(action) = crate::model::action_of(&event) else {
-            continue;
-        };
-        if !matches!(action, "misextraction" | "never_true" | "support_withdrawn") {
-            continue;
-        }
-        let targets = lifecycle_targets(db, &event);
-        let (authorized, target_scope) =
-            lifecycle_authorized(trust_state, &event, action, &targets);
-        if !readable.contains(&event.authority_scope)
-            && !target_scope
-                .as_deref()
-                .is_some_and(|scope| readable.contains(scope))
-        {
-            continue;
-        }
-        let accepted = verification == "verified" && authorized;
-        rows.push(json!({
-            "action": action,
-            "event_id": event.event_id,
-            "cursor": cursor.to_string(),
-            "authority_id": event.authority_id,
-            "authority_scope": event.authority_scope,
-            "logical_key": targets.first().map(|(_, key, _)| key.clone()).unwrap_or_else(|| event.logical_key.clone()),
-            "target_event_ids": targets.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>(),
-            "target_scope": target_scope,
-            "accepted": accepted,
-            "refusal_code": if accepted { Value::Null } else { Value::String("AUTHORITY_WRONG_SCOPE".to_owned()) },
-            "asserted_at": event.asserted_at,
-            "reason_code": event.statement
-        }));
-    }
+    let mut rows: Vec<Value> = event_rows
+        .iter()
+        .filter(|row| {
+            ["authority_scope", "target_scope"].iter().any(|key| {
+                crate::json::get_str(row, key).is_some_and(|scope| readable.contains(scope))
+            })
+        })
+        .cloned()
+        .collect();
     for record in db.audit_records("lifecycle-refusal").unwrap_or_default() {
         let visible = ["authority_scope", "target_scope"].iter().any(|key| {
             crate::json::get_str(&record, key).is_some_and(|scope| readable.contains(scope))
@@ -993,51 +980,24 @@ fn lifecycle_admissions(
     rows
 }
 
-/// Parent bindings of every current fact, resolved to the parent's logical
-/// key, so a client holding other stores can reopen dependent decisions when
-/// a parent fact loses its last support anywhere.
+/// Parent bindings of every current fact sent, resolved to the parent's
+/// logical key, so a client holding other stores can reopen dependent decisions
+/// when a parent fact loses its last support anywhere. Resolved once per
+/// reduction; a snapshot only picks the facts it sends.
 fn fact_parents(
-    db: &CompanyDb,
+    resolved: &BTreeMap<String, Value>,
     view: &crate::reducer::CurrentView,
     sent_ids: &BTreeSet<String>,
 ) -> Value {
-    let mut by_event: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
-    for (_, payload, _) in db.events_of_kind("fact-event").unwrap_or_default() {
-        let event_id = crate::json::get_str(&payload, "event_id").unwrap_or_default();
-        let logical_key = crate::json::get_str(&payload, "logical_key").unwrap_or_default();
-        let parents = crate::json::get_array(&payload, "parents")
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        by_event.insert(event_id.to_owned(), (logical_key.to_owned(), parents));
-    }
     let mut map = serde_json::Map::new();
     for fact in view
         .facts
         .iter()
         .filter(|fact| sent_ids.contains(&fact.fact_id))
     {
-        let Some((_, parents)) = by_event.get(&fact.event_id) else {
-            continue;
-        };
-        if parents.is_empty() {
-            continue;
+        if let Some(parents) = resolved.get(&fact.fact_id) {
+            map.insert(fact.fact_id.clone(), parents.clone());
         }
-        let resolved: Vec<Value> = parents
-            .iter()
-            .map(|parent| {
-                json!({
-                    "event_id": parent,
-                    "logical_key": by_event.get(parent).map(|(key, _)| key.clone()).unwrap_or_default()
-                })
-            })
-            .collect();
-        map.insert(fact.fact_id.clone(), Value::Array(resolved));
     }
     Value::Object(map)
 }
@@ -1116,7 +1076,11 @@ fn facts(
         .get("as_of")
         .cloned()
         .unwrap_or_else(|| now.to_owned());
-    let view = current_view(db, trust_state, &as_of).map_err(|error| refuse(500, error))?;
+    let cached = state
+        .views
+        .read(db, trust_state, &as_of, now)
+        .map_err(|error| refuse(500, error))?;
+    let view = &cached.view;
     let selected: Vec<Value> = view
         .facts
         .iter()
@@ -1163,12 +1127,7 @@ fn facts(
         .iter()
         .map(|fact| fact.event_id.clone())
         .collect();
-    let mut payloads: BTreeMap<String, Value> = BTreeMap::new();
-    for (_, payload, _) in db.events_of_kind("fact-event").unwrap_or_default() {
-        if let Some(event_id) = crate::json::get_str(&payload, "event_id") {
-            payloads.insert(event_id.to_owned(), payload);
-        }
-    }
+    let payloads = &cached.payloads;
     for trace in &view.traces {
         let mut evaluated: Vec<(String, &str, String)> = Vec::new();
         for event_id in &trace.admitted_event_ids {
@@ -1355,7 +1314,11 @@ fn fact_detail(
             }),
         ));
     }
-    let view = current_view(db, trust_state, now).map_err(|error| refuse(500, error))?;
+    let cached = state
+        .views
+        .read(db, trust_state, now, now)
+        .map_err(|error| refuse(500, error))?;
+    let view = &cached.view;
     let Some(fact) = view.facts.iter().find(|fact| fact.fact_id == fact_id) else {
         return Err(refuse(
             404,
@@ -2122,8 +2085,20 @@ fn snapshot(
             ContractError::invariant("a fresh client nonce is required for a signed snapshot"),
         ));
     }
+    // The content digest of the snapshot the client already holds, if any.
+    let known = request.query.get("known").cloned().unwrap_or_default();
+    if known.len() > 128 {
+        return Err(refuse(
+            400,
+            ContractError::invariant("a known content digest is at most 128 bytes"),
+        ));
+    }
     let readable = readable_scopes(auth, trust_state);
-    let view = current_view(db, trust_state, now).map_err(|error| refuse(500, error))?;
+    let cached = state
+        .views
+        .read(db, trust_state, now, now)
+        .map_err(|error| refuse(500, error))?;
+    let view = &cached.view;
     // A repository asks for its own direction, not the company's entire corpus.
     // A ruling that governs `example/sync` is not direction for `booking`:
     // shipping it anyway made the snapshot grow with the estate until it passed
@@ -2131,6 +2106,45 @@ fn snapshot(
     // the meantime it filled every projection with other services' rulings. A
     // fact that governs nothing in particular is company-wide and always sent.
     let repository = request.query.get("repository").cloned().unwrap_or_default();
+    let events_since = request
+        .query
+        .get("events_since")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    // Everything the content depends on besides the reduction the cache entry
+    // already names. Relaxations are replaced in place, and fact versions and
+    // lifecycle refusals land without an event, so they are read, not assumed.
+    let relaxations = db.relaxations().map_err(|error| refuse(500, error))?;
+    let certificates = db.all_certificates().map_err(|error| refuse(500, error))?;
+    let content_key = crate::hash::sha256_bytes(&crate::json::canonical_bytes(&json!({
+        "readable": readable,
+        "repository": repository,
+        "events_since": events_since,
+        "relaxations": relaxations,
+        "certificates": certificates,
+        "fact_versions": db.fact_versions_mark().map_err(|error| refuse(500, error))?,
+        "lifecycle_refusals": db.audit_mark("lifecycle-refusal").map_err(|error| refuse(500, error))?,
+    })));
+    // A client whose snapshot is still the content is answered with a signed
+    // receipt instead of the content again: between ingests nearly every
+    // refresh is this, and resending tens of megabytes to say "no change" is
+    // what made refreshes expensive for both ends.
+    if !known.is_empty() && cached.content_digest(&content_key).as_deref() == Some(known.as_str()) {
+        return unchanged_receipt(
+            db,
+            state,
+            auth,
+            trust_state,
+            &client_nonce,
+            &repository,
+            &known,
+            now,
+        );
+    }
+    // Only assembly is bounded: a receipt costs a signature, not the content.
+    let Some(_assembly) = state.snapshots.acquire() else {
+        return Err(refuse(503, snapshot_ceiling_refusal()));
+    };
     // Ownership rulings say where work lands. A ticket in one repository
     // that edits paths in another needs the other's rulings, so they are
     // delivered to every repository whatever they govern; there are few and
@@ -2174,13 +2188,9 @@ fn snapshot(
     // signed events (architecture §6: the reducer is a pure function of the
     // admitted event set). Company remains the authority for its own current
     // view; the events are the inputs it reduced, not a second opinion.
-    let events_since = request
-        .query
-        .get("events_since")
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0);
     let (mut events, events_omitted_count, events_sealed_cursor) =
-        snapshot_events(db, &readable, events_since).map_err(|error| refuse(500, error))?;
+        snapshot_events(db, &cached.event_index, &readable, events_since)
+            .map_err(|error| refuse(500, error))?;
     // A partial window is one the client must not reduce over -- it would drop
     // the supersession that retired a head -- so it falls back to the derived
     // `facts`. Sending it anyway is a third of a megabyte the reader is
@@ -2231,18 +2241,9 @@ fn snapshot(
         .chain(events.iter())
         .map(|item| crate::json::canonical_bytes(item).len())
         .sum();
-    charge_read(db, state, auth, facts.len().max(1), bytes)?;
-    let snapshot = json!({
+    let mut snapshot = json!({
         "schema": "kinbase-snapshot/1",
         "company_id": state.config.company_id,
-        "cursor": trust_state.cursor.to_string(),
-        "authority_cursor": trust_state.authority_cursor.clone(),
-        "service_cursor": trust_state.cursor.to_string(),
-        "revocation_cursor": db.revocation_cursor().map_err(|error| refuse(500, error))?,
-        "client_nonce": client_nonce,
-        "issued_at": now,
-        "revocation_valid_until": crate::time::plus_seconds(now, state.config.revocation_freshness_seconds).unwrap_or_default(),
-        "fact_valid_until": crate::time::plus_seconds(now, state.config.default_fact_freshness_seconds).unwrap_or_default(),
         "facts": facts,
         "facts_scope": if repository.is_empty() { String::new() } else { format!("repository:{repository}") },
         "facts_governing_elsewhere_count": facts_elsewhere_count,
@@ -2257,10 +2258,10 @@ fn snapshot(
         "registry": trust_state.public_registry(),
         "revocations": trust_state.revocations,
         "scope_revocations": trust_state.scope_revocations,
-        "relaxations": db.relaxations().map_err(|error| refuse(500, error))?,
-        "certificates": db.all_certificates().map_err(|error| refuse(500, error))?,
+        "relaxations": relaxations,
+        "certificates": certificates,
         "fact_versions": fact_versions,
-        "lifecycle_admissions": lifecycle_admissions(db, trust_state, &readable),
+        "lifecycle_admissions": lifecycle_admissions(db, &cached.lifecycle_rows, &readable),
         // Every revocation ever recorded, including keys the steward later
         // republished: a later epoch authorizes new events, but facts asserted
         // before the revocation remain historical (architecture §3).
@@ -2282,7 +2283,7 @@ fn snapshot(
                 }))
             })
             .collect::<Vec<_>>(),
-        "fact_parents": fact_parents(db, &view, &sent_ids),
+        "fact_parents": fact_parents(&cached.fact_parents, view, &sent_ids),
         "traces": view.traces.iter().filter(|trace| sent_keys.contains(trace.logical_key.as_str())).map(|trace| json!({
             "logical_key": trace.logical_key,
             "state": trace.state,
@@ -2291,11 +2292,128 @@ fn snapshot(
             "unknown_id": trace.unknown_id
         })).collect::<Vec<_>>()
     });
+    // The digest names what the snapshot holds, without when or for whom it
+    // was answered; it is signed inside the snapshot, so a client can later
+    // offer it back as `known`.
+    let content_digest = crate::hash::sha256_bytes(&crate::json::canonical_bytes(&snapshot));
+    cached.remember_content_digest(content_key, content_digest.clone());
+    if !known.is_empty() && known == content_digest {
+        return unchanged_receipt(
+            db,
+            state,
+            auth,
+            trust_state,
+            &client_nonce,
+            &repository,
+            &known,
+            now,
+        );
+    }
+    charge_read(db, state, auth, facts.len().max(1), bytes)?;
+    if let Value::Object(map) = &mut snapshot {
+        map.extend(snapshot_freshness(
+            db,
+            state,
+            trust_state,
+            &client_nonce,
+            now,
+        )?);
+        map.insert("content_digest".to_owned(), Value::String(content_digest));
+    }
     let signed = state
         .root
         .sign_document("receipt", &snapshot)
         .map_err(|error| refuse(500, error))?;
     db.bump("snapshots").map_err(|error| refuse(500, error))?;
+    Ok((200, signed))
+}
+
+/// When and for whom a snapshot was answered, as opposed to what it holds:
+/// the cursors, the client's nonce, and both validity clocks. These sit
+/// outside the content digest, and they are what an unchanged receipt signs
+/// afresh (architecture §2: every refresh signs the client's nonce and a
+/// cursor no older than the current revocation cursor).
+fn snapshot_freshness(
+    db: &CompanyDb,
+    state: &ServiceState,
+    trust_state: &TrustState,
+    client_nonce: &str,
+    now: &str,
+) -> Result<serde_json::Map<String, Value>, (u16, ContractError)> {
+    let revocation_cursor = db.revocation_cursor().map_err(|error| refuse(500, error))?;
+    let valid_until = |seconds| crate::time::plus_seconds(now, seconds).unwrap_or_default();
+    let mut fields = serde_json::Map::new();
+    for (key, value) in [
+        ("cursor", trust_state.cursor.to_string()),
+        ("authority_cursor", trust_state.authority_cursor.clone()),
+        ("service_cursor", trust_state.cursor.to_string()),
+        ("revocation_cursor", revocation_cursor),
+        ("client_nonce", client_nonce.to_owned()),
+        ("issued_at", now.to_owned()),
+        (
+            "revocation_valid_until",
+            valid_until(state.config.revocation_freshness_seconds),
+        ),
+        (
+            "fact_valid_until",
+            valid_until(state.config.default_fact_freshness_seconds),
+        ),
+    ] {
+        fields.insert(key.to_owned(), Value::String(value));
+    }
+    Ok(fields)
+}
+
+/// A signed statement that the snapshot whose content digest the client
+/// offered is still Company's answer for its scopes and repository, with
+/// fresh cursors, nonce and validity clocks. The client keeps the content it
+/// already verified and takes its freshness from this receipt.
+#[allow(clippy::too_many_arguments)]
+fn unchanged_receipt(
+    db: &CompanyDb,
+    state: &ServiceState,
+    auth: &AuthContext,
+    trust_state: &TrustState,
+    client_nonce: &str,
+    repository: &str,
+    content_digest: &str,
+    now: &str,
+) -> Handled {
+    let mut receipt = snapshot_freshness(db, state, trust_state, client_nonce, now)?;
+    receipt.insert(
+        "schema".to_owned(),
+        Value::String(SNAPSHOT_UNCHANGED_SCHEMA.to_owned()),
+    );
+    receipt.insert(
+        "company_id".to_owned(),
+        Value::String(state.config.company_id.clone()),
+    );
+    receipt.insert(
+        "facts_scope".to_owned(),
+        Value::String(if repository.is_empty() {
+            String::new()
+        } else {
+            format!("repository:{repository}")
+        }),
+    );
+    receipt.insert(
+        "content_digest".to_owned(),
+        Value::String(content_digest.to_owned()),
+    );
+    let receipt = Value::Object(receipt);
+    charge_read(
+        db,
+        state,
+        auth,
+        1,
+        crate::json::canonical_bytes(&receipt).len(),
+    )?;
+    let signed = state
+        .root
+        .sign_document("receipt", &receipt)
+        .map_err(|error| refuse(500, error))?;
+    db.bump("snapshots_unchanged")
+        .map_err(|error| refuse(500, error))?;
     Ok((200, signed))
 }
 
@@ -2311,6 +2429,8 @@ fn snapshot(
 /// possible failure because it looks like nothing is wrong. Older events stay
 /// reachable through `GET /events?since=`, which has always paged.
 const SNAPSHOT_EVENT_LIMIT: usize = 400;
+/// The schema of a signed "your snapshot is still current" receipt.
+pub const SNAPSHOT_UNCHANGED_SCHEMA: &str = "kinbase-snapshot-unchanged/1";
 /// And a byte budget, which is the ceiling that actually binds. The client
 /// refuses a response over `MAX_BODY_BYTES * 4` (1 MiB); the rest of the
 /// snapshot -- the current view, certificates, registry, revocation history --
@@ -2324,65 +2444,61 @@ const FACT_VERSIONS_KEPT: usize = 3;
 
 fn snapshot_events(
     db: &CompanyDb,
+    index: &[super::view_cache::EventRef],
     readable: &BTreeSet<String>,
     since: i64,
 ) -> Result<(Vec<Value>, usize, String), ContractError> {
-    let mut selected: Vec<(i64, Value, usize)> = Vec::new();
-    let mut omitted = 0usize;
-    for kind in ["fact-event", "unknown-event"] {
-        for (cursor, payload, verification) in db.events_of_kind(kind)? {
-            let scope = crate::json::get_str(&payload, "authority_scope").unwrap_or_default();
-            if !readable.contains(scope) {
-                continue;
-            }
-            if cursor <= since {
-                // Already sealed by this client at an earlier refresh.
-                continue;
-            }
-            let record = json!({
-                "cursor": cursor.to_string(),
-                "kind": kind,
-                "verification": verification,
-                "document": payload
-            });
-            // Size it once, here. Measuring in a second pass re-serialized every
-            // record on every snapshot request, which a soak test that polls the
-            // endpoint feels immediately.
-            let size = crate::json::canonical_bytes(&record).len();
-            selected.push((cursor, record, size));
-        }
-    }
     // Newest first, so a truncated window carries the most recent history
-    // rather than whichever kind sorted first.
-    selected.sort_by(|left, right| right.0.cmp(&left.0));
-    if selected.len() > SNAPSHOT_EVENT_LIMIT {
-        omitted = selected.len() - SNAPSHOT_EVENT_LIMIT;
-        selected.truncate(SNAPSHOT_EVENT_LIMIT);
-    }
+    // rather than whichever kind sorted first. The cached index already holds
+    // that order; already-sealed and unreadable events are skipped here.
+    let candidates: Vec<&super::view_cache::EventRef> = index
+        .iter()
+        .filter(|event| event.cursor > since && readable.contains(&event.authority_scope))
+        .collect();
+    let readable_count = candidates.len();
+    // Load and size only the window that can be sent. Parsing the whole log to
+    // keep at most SNAPSHOT_EVENT_LIMIT of it cost every snapshot the log's
+    // size in memory, for a window the caller then discards when anything was
+    // omitted.
+    let window: Vec<&super::view_cache::EventRef> =
+        candidates.into_iter().take(SNAPSHOT_EVENT_LIMIT).collect();
+    let cursors: Vec<i64> = window.iter().map(|event| event.cursor).collect();
+    let mut rows: BTreeMap<i64, (Value, String)> = db
+        .events_at(&cursors)?
+        .into_iter()
+        .map(|(cursor, payload, verification)| (cursor, (payload, verification)))
+        .collect();
+    let mut selected: Vec<(i64, Value)> = Vec::new();
     let mut spent = 0usize;
-    let mut kept = 0usize;
-    for (_, _, size) in &selected {
-        if kept > 0 && spent + size > SNAPSHOT_EVENT_BYTES {
+    for event in window {
+        let Some((payload, verification)) = rows.remove(&event.cursor) else {
+            continue;
+        };
+        let record = json!({
+            "cursor": event.cursor.to_string(),
+            "kind": event.kind,
+            "verification": verification,
+            "document": payload
+        });
+        let size = crate::json::canonical_bytes(&record).len();
+        if !selected.is_empty() && spent + size > SNAPSHOT_EVENT_BYTES {
             break;
         }
         spent += size;
-        kept += 1;
+        selected.push((event.cursor, record));
     }
-    if kept < selected.len() {
-        omitted += selected.len() - kept;
-        selected.truncate(kept);
-    }
+    let omitted = readable_count - selected.len();
     // The client may seal up to the oldest event it actually received; anything
     // older was omitted and must still be reachable from `/events`.
     let sealed = selected
         .iter()
-        .map(|(cursor, _, _)| *cursor)
+        .map(|(cursor, _)| *cursor)
         .min()
         .map(|cursor| (cursor - 1).max(since))
         .unwrap_or(since);
-    selected.sort_by_key(|(cursor, _, _)| *cursor);
+    selected.sort_by_key(|(cursor, _)| *cursor);
     Ok((
-        selected.into_iter().map(|(_, value, _)| value).collect(),
+        selected.into_iter().map(|(_, value)| value).collect(),
         omitted,
         sealed.to_string(),
     ))
@@ -3795,10 +3911,26 @@ fn issue_token(db: &CompanyDb, auth: &AuthContext, body: Option<Value>, now: &st
     ))
 }
 
+/// Usage rows older than `usage_retention_seconds` go once the oldest of them
+/// is an hour past due. Rows lapse about as fast as requests arrive, and
+/// deleting each one as it lapsed put a write ahead of nearly every response.
+fn prune_usage(db: &CompanyDb, state: &ServiceState, now: &str) -> Result<(), ContractError> {
+    let ago =
+        |seconds: i64| crate::time::plus_seconds(now, -seconds).map_err(ContractError::internal);
+    let retention = state.config.usage_retention_seconds;
+    db.prune_usage(&ago(retention)?, &ago(retention + 3600)?)?;
+    Ok(())
+}
+
 /// Periodic obligations executed on request arrival: manifest observation
-/// expiry, orphan deadlines, nonce pruning.
+/// expiry, orphan deadlines, nonce and usage pruning.
 fn maintenance(db: &CompanyDb, state: &ServiceState, now: &str) -> Result<(), ContractError> {
     db.prune_nonces(now)?;
+    // Like recording, pruning usage rows never changes the answer a caller
+    // gets: a failure is reported, not raised.
+    if let Err(error) = prune_usage(db, state, now) {
+        crate::output::diagnostic("usage-prune-failed", json!({"code": error.code}));
+    }
     for expired in db.expire_manifest_observations(now)? {
         let repository = crate::json::get_str(&expired, "repository_uuid").unwrap_or_default();
         let event = json!({
@@ -3960,6 +4092,8 @@ nonce_retention_seconds = 1300
             config,
             root: root_key.clone(),
             started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
         };
         let now = crate::time::now_rfc3339_millis();
         let trust = trust::load(&db, &root_key.public()).unwrap();
@@ -4239,6 +4373,8 @@ mod packet11_tests {
             requests_per_minute: 600,
             revocation_freshness_seconds: 900,
             directory_retention_seconds: 365 * 24 * 3600,
+            record_usage: false,
+            usage_retention_seconds: 30 * 24 * 3600,
             facts_token_scopes: Vec::new(),
         };
         let db = CompanyDb::open(&config.sqlite_path).unwrap();
@@ -4247,6 +4383,8 @@ mod packet11_tests {
             config,
             root: root_key,
             started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
         };
         let now = crate::time::now_rfc3339_millis();
         let expires_at = crate::time::plus_seconds(&now, 60).unwrap();
@@ -4317,6 +4455,8 @@ mod auth_subject_tests {
             requests_per_minute: 600,
             revocation_freshness_seconds: 900,
             directory_retention_seconds: 365 * 24 * 3600,
+            record_usage: false,
+            usage_retention_seconds: 30 * 24 * 3600,
             facts_token_scopes: Vec::new(),
         };
         let db = CompanyDb::open(&config.sqlite_path).unwrap();
@@ -4325,6 +4465,8 @@ mod auth_subject_tests {
             config,
             root: PrivateKey::generate(),
             started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
         };
         (db, state)
     }
@@ -4403,6 +4545,7 @@ mod auth_subject_tests {
 #[cfg(test)]
 mod scope_and_token_tests {
     use super::*;
+    use crate::company::reduction::current_view;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -4459,6 +4602,8 @@ nonce_retention_seconds = 1300
             config,
             root: root.clone(),
             started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
         };
         Service {
             temp,
@@ -4868,6 +5013,512 @@ nonce_retention_seconds = 1300
     }
 
     #[test]
+    fn a_snapshot_beyond_the_assembly_ceiling_is_refused_not_queued() {
+        let service = service("");
+        let reader = auth(&service, "facts-one");
+        let trust = trust::load(&service.db, &service.root.public()).unwrap();
+        let now = crate::time::now_rfc3339_millis();
+        let ask = || {
+            super::snapshot(
+                &service.db,
+                &service.state,
+                &reader,
+                &trust,
+                &get("/snapshot", &[("nonce", "ceiling")]),
+                &now,
+            )
+        };
+        let held: Vec<_> = (0..MAX_CONCURRENT_SNAPSHOTS)
+            .map(|_| service.state.snapshots.acquire().expect("a free place"))
+            .collect();
+        let Err((status, error)) = ask() else {
+            panic!("a snapshot past the ceiling was assembled");
+        };
+        assert_eq!((status, error.code.as_str()), (503, "LIMIT_EXCEEDED"));
+        assert!(error.retryable, "a busy ceiling clears on its own");
+        drop(held);
+        assert_eq!(ask().map(|(status, _)| status).ok(), Some(200));
+        // Every place came back: a full set can be claimed again.
+        let again: Vec<_> = (0..MAX_CONCURRENT_SNAPSHOTS)
+            .filter_map(|_| service.state.snapshots.acquire())
+            .collect();
+        assert_eq!(again.len(), MAX_CONCURRENT_SNAPSHOTS);
+    }
+
+    #[test]
+    fn a_cached_view_is_the_reduction_at_every_cursor_and_instant() {
+        let service = service("facts_token_scopes = [\"architecture:scheduling\"]");
+        let steward = auth(&service, "facts-one");
+        let architect = PrivateKey::generate();
+        let now = crate::time::now_rfc3339_millis();
+        let later = crate::time::plus_seconds(&now, 3600).unwrap();
+        let after_later = crate::time::plus_seconds(&now, 7200).unwrap();
+        let trust = trust::load(&service.db, &service.root.public()).unwrap();
+        let registry = service
+            .root
+            .sign_document(
+                "authority-registry-entry",
+                &json!({
+                    "schema": crate::model::REGISTRY_SCHEMA,
+                    "authority_cursor": "1000",
+                    "entries": [
+                        {"authority_id": "scheduling-architect", "scope": "architecture:scheduling",
+                         "public_key": architect.public().to_hex(), "channel": "process:architecture-answer",
+                         "capabilities": ["answer"]}
+                    ]
+                }),
+            )
+            .unwrap();
+        publish_registry(&service.db, &steward, &trust, Some(registry), &now).unwrap();
+        // Reads through the cache, and proves each one equals a fresh reduction.
+        let read = |as_of: &str| {
+            let trust = trust::load(&service.db, &service.root.public()).unwrap();
+            let cached = service
+                .state
+                .views
+                .read(&service.db, &trust, as_of, &now)
+                .unwrap();
+            let mut fresh = current_view(&service.db, &trust, as_of).unwrap();
+            fresh.as_of = cached.view.as_of.clone();
+            assert_eq!(
+                serde_json::to_value(&cached.view).unwrap(),
+                serde_json::to_value(&fresh).unwrap(),
+                "the cached view at {as_of} is not the reduction at {as_of}"
+            );
+            cached
+        };
+        let statements = |view: &super::super::view_cache::CompanyView| -> Vec<String> {
+            view.view
+                .facts
+                .iter()
+                .map(|fact| fact.statement.clone())
+                .collect()
+        };
+        let ruling = |id: &str, key: &str, statement: &str, effective_from: &str| {
+            let mut document = fact(
+                &architect,
+                id,
+                "scheduling-architect",
+                "architecture:scheduling",
+                statement,
+            );
+            let map = document.as_object_mut().unwrap();
+            map.insert("logical_key".to_owned(), json!(key));
+            map.insert("effective_from".to_owned(), json!(effective_from));
+            let unsigned = Value::Object(map.clone());
+            append(
+                &service,
+                &architect.sign_document("fact-event", &unsigned).unwrap(),
+            );
+        };
+
+        let empty = read(&now);
+        assert!(statements(&empty).is_empty());
+        // Inside one validity window a reader shares the reduction.
+        assert!(Arc::ptr_eq(&empty, &read(&now)));
+
+        // A new event moves the cursor: the next read reduces again.
+        ruling(
+            "now",
+            "scheduling/queue-wait",
+            "Queue wait is bounded at five seconds.",
+            "2025-01-01T00:00:00.000Z",
+        );
+        assert_eq!(
+            statements(&read(&now)),
+            ["Queue wait is bounded at five seconds."]
+        );
+
+        // An event that becomes effective later is a boundary: crossing it in
+        // either direction is a different reduction, not the cached one.
+        ruling(
+            "later",
+            "scheduling/retries",
+            "Retries back off exponentially.",
+            &later,
+        );
+        assert!(!statements(&read(&now)).contains(&"Retries back off exponentially.".to_owned()));
+        assert!(
+            statements(&read(&after_later)).contains(&"Retries back off exponentially.".to_owned())
+        );
+        assert!(!statements(&read(&now)).contains(&"Retries back off exponentially.".to_owned()));
+    }
+
+    /// A service with one architect registered for `architecture:scheduling`
+    /// and one ruling admitted, for the snapshot receipt tests.
+    fn service_with_a_ruling() -> (Service, PrivateKey) {
+        let service = service("facts_token_scopes = [\"architecture:scheduling\"]");
+        let steward = auth(&service, "facts-one");
+        let architect = PrivateKey::generate();
+        let now = crate::time::now_rfc3339_millis();
+        let trust = trust::load(&service.db, &service.root.public()).unwrap();
+        let registry = service
+            .root
+            .sign_document(
+                "authority-registry-entry",
+                &json!({
+                    "schema": crate::model::REGISTRY_SCHEMA,
+                    "authority_cursor": "1000",
+                    "entries": [
+                        {"authority_id": "scheduling-architect", "scope": "architecture:scheduling",
+                         "public_key": architect.public().to_hex(), "channel": "process:architecture-answer",
+                         "capabilities": ["answer"]}
+                    ]
+                }),
+            )
+            .unwrap();
+        publish_registry(&service.db, &steward, &trust, Some(registry), &now).unwrap();
+        append(
+            &service,
+            &fact(
+                &architect,
+                "wait",
+                "scheduling-architect",
+                "architecture:scheduling",
+                "Queue wait is bounded at five seconds.",
+            ),
+        );
+        (service, architect)
+    }
+
+    fn snapshot_with(service: &Service, state: &ServiceState, query: &[(&str, &str)]) -> Value {
+        let reader = auth(service, "facts-one");
+        let trust = trust::load(&service.db, &service.root.public()).unwrap();
+        let now = crate::time::now_rfc3339_millis();
+        let (status, document) = super::snapshot(
+            &service.db,
+            state,
+            &reader,
+            &trust,
+            &get("/snapshot", query),
+            &now,
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            PublicKey::verify_document("receipt", &document),
+            Some(service.root.public()),
+            "every answer is root-signed"
+        );
+        document
+    }
+
+    #[test]
+    fn a_client_holding_the_current_content_gets_a_signed_receipt() {
+        let (service, architect) = service_with_a_ruling();
+        let full = snapshot_with(&service, &service.state, &[("nonce", "first")]);
+        assert_eq!(full["schema"], "kinbase-snapshot/1");
+        let digest = full["content_digest"].as_str().unwrap().to_owned();
+
+        // Offered back, the digest is answered with a receipt that signs this
+        // request's nonce and the current cursors, and carries no content.
+        let receipt = snapshot_with(
+            &service,
+            &service.state,
+            &[("nonce", "second"), ("known", digest.as_str())],
+        );
+        assert_eq!(receipt["schema"], SNAPSHOT_UNCHANGED_SCHEMA);
+        assert_eq!(receipt["client_nonce"], "second");
+        assert_eq!(receipt["content_digest"], digest.as_str());
+        assert_eq!(receipt["cursor"], full["cursor"]);
+        assert_eq!(receipt["facts_scope"], "");
+        assert!(receipt.get("facts").is_none());
+        assert!(crate::json::canonical_bytes(&receipt).len() < 2048);
+
+        // A restarted service has no memo: it rebuilds the content once and
+        // still answers the unchanged client with a receipt.
+        let restarted = ServiceState {
+            config: service.state.config.clone(),
+            root: service.state.root.clone(),
+            started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
+        };
+        let after_restart = snapshot_with(
+            &service,
+            &restarted,
+            &[("nonce", "third"), ("known", digest.as_str())],
+        );
+        assert_eq!(after_restart["schema"], SNAPSHOT_UNCHANGED_SCHEMA);
+
+        // A digest of other content, or another repository's direction, is
+        // answered with the whole snapshot.
+        let stranger = snapshot_with(
+            &service,
+            &service.state,
+            &[("nonce", "fourth"), ("known", "0".repeat(64).as_str())],
+        );
+        assert_eq!(stranger["schema"], "kinbase-snapshot/1");
+        let elsewhere = snapshot_with(
+            &service,
+            &service.state,
+            &[
+                ("nonce", "fifth"),
+                ("known", digest.as_str()),
+                ("repository", "booking"),
+            ],
+        );
+        assert_eq!(elsewhere["schema"], "kinbase-snapshot/1");
+        assert_eq!(elsewhere["facts_scope"], "repository:booking");
+
+        // New content is never vouched for: the next answer is the whole
+        // snapshot, under a new digest.
+        append(
+            &service,
+            &fact(
+                &architect,
+                "retries",
+                "scheduling-architect",
+                "architecture:scheduling",
+                "Retries back off exponentially.",
+            ),
+        );
+        let changed = snapshot_with(
+            &service,
+            &service.state,
+            &[("nonce", "sixth"), ("known", digest.as_str())],
+        );
+        assert_eq!(changed["schema"], "kinbase-snapshot/1");
+        assert_ne!(changed["content_digest"], digest.as_str());
+    }
+
+    #[test]
+    fn a_refresh_over_the_wire_renews_the_cached_snapshot_with_a_receipt() {
+        use crate::company::client::{Client, SnapshotRefresh};
+        let (service, architect) = service_with_a_ruling();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = service.state.config.clone();
+        config.bind = address;
+        let state = Arc::new(ServiceState {
+            config,
+            root: service.root.clone(),
+            started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
+        });
+        // The connection path `serve` runs, without its liveness watcher,
+        // which exits the process once a test's temporary store is gone.
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || handle_connection(stream, state));
+            }
+        });
+        let cache_root = service.temp.path().join("client-cache");
+        let client = Client::new(
+            &format!("http://{address}"),
+            crate::config::TokenRecord {
+                token: "facts-one".to_owned(),
+            },
+            PrivateKey::generate(),
+            Some(service.root.public()),
+            cache_root.clone(),
+            false,
+        )
+        .unwrap();
+        let mut cache = crate::company::cache::Cache::open(&cache_root).unwrap();
+        let now = crate::time::now_rfc3339_millis();
+
+        // A cold cache offers nothing and receives the whole snapshot.
+        assert_eq!(cache.known_content_digest(""), None);
+        let SnapshotRefresh::Snapshot(snapshot) = client.refresh_for("", None).unwrap() else {
+            panic!("a refresh that offered nothing was answered with a receipt");
+        };
+        cache
+            .store_snapshot(&snapshot, &service.root.public(), &now)
+            .unwrap();
+
+        // A warm cache offers its digest and is renewed by a receipt.
+        let known = cache
+            .known_content_digest("")
+            .expect("a signed digest is cached");
+        let SnapshotRefresh::Unchanged(receipt) = client.refresh_for("", Some(&known)).unwrap()
+        else {
+            panic!("an unchanged store answered with the whole snapshot");
+        };
+        cache
+            .store_unchanged(&receipt, &service.root.public(), &now)
+            .unwrap();
+
+        // New content is fetched whole, never vouched for.
+        append(
+            &service,
+            &fact(
+                &architect,
+                "retries",
+                "scheduling-architect",
+                "architecture:scheduling",
+                "Retries back off exponentially.",
+            ),
+        );
+        let SnapshotRefresh::Snapshot(changed) = client.refresh_for("", Some(&known)).unwrap()
+        else {
+            panic!("changed content was answered with a receipt");
+        };
+        cache
+            .store_snapshot(&changed, &service.root.public(), &now)
+            .unwrap();
+        assert_ne!(cache.known_content_digest(""), Some(known));
+    }
+
+    #[test]
+    fn a_receipt_for_content_replaced_meanwhile_is_followed_by_one_full_refresh() {
+        use crate::company::client::{Client, SnapshotRefresh};
+        let (service, _) = service_with_a_ruling();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = service.state.config.clone();
+        config.bind = address;
+        let state = Arc::new(ServiceState {
+            config,
+            root: service.root.clone(),
+            started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
+        });
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || handle_connection(stream, state));
+            }
+        });
+        let cache_root = service.temp.path().join("client-cache");
+        let client = Client::new(
+            &format!("http://{address}"),
+            crate::config::TokenRecord {
+                token: "facts-one".to_owned(),
+            },
+            PrivateKey::generate(),
+            Some(service.root.public()),
+            cache_root.clone(),
+            false,
+        )
+        .unwrap();
+        let mut cache = crate::company::cache::Cache::open(&cache_root).unwrap();
+        let now = crate::time::now_rfc3339_millis();
+        let SnapshotRefresh::Snapshot(snapshot) = client.refresh_for("", None).unwrap() else {
+            panic!("a cold refresh was answered with a receipt");
+        };
+        cache
+            .store_snapshot(&snapshot, &service.root.public(), &now)
+            .unwrap();
+        let known = cache.known_content_digest("").unwrap();
+        let receipt = client.refresh_for("", Some(&known)).unwrap();
+        assert!(matches!(receipt, SnapshotRefresh::Unchanged(_)));
+        // Another refresh replaces the cached content before the receipt lands.
+        let replaced = service
+            .root
+            .sign_document(
+                "receipt",
+                &json!({
+                    "schema": "kinbase-snapshot/1",
+                    "company_id": snapshot["company_id"],
+                    "cursor": snapshot["cursor"],
+                    "facts": [],
+                    "facts_scope": "",
+                    "certificates": [],
+                    "content_digest": "e".repeat(64),
+                }),
+            )
+            .unwrap();
+        cache
+            .store_snapshot(&replaced, &service.root.public(), &now)
+            .unwrap();
+        let stored = crate::repository::store_refresh(
+            &client,
+            &mut cache,
+            "",
+            receipt,
+            &service.root.public(),
+            &now,
+        )
+        .expect("one full refresh follows the refused receipt");
+        assert_eq!(stored["schema"], "kinbase-snapshot/1");
+        assert_eq!(
+            cache.known_content_digest("").as_deref(),
+            Some(known.as_str())
+        );
+    }
+
+    /// The memo answers "unchanged" without building the content, so it is
+    /// only as sound as its key: everything the content depends on must be in
+    /// the cached reduction or in the key. A field added to the snapshot fails
+    /// here until it is classified, and a content field is classified only by
+    /// naming what covers it.
+    #[test]
+    fn every_snapshot_field_is_freshness_or_covered_by_the_memo_key() {
+        const CONTENT: [(&str, &str); 22] = [
+            ("schema", "constant"),
+            ("company_id", "service config"),
+            ("facts", "reduction + readable + repository"),
+            ("facts_scope", "repository"),
+            (
+                "facts_governing_elsewhere_count",
+                "reduction + readable + repository",
+            ),
+            ("denied_count", "reduction + readable"),
+            ("unknowns", "reduction + readable"),
+            ("traces", "reduction + readable + repository"),
+            ("fact_parents", "event log (cursor) + reduction"),
+            ("fact_versions", "fact_versions mark + reduction"),
+            ("events", "event log (cursor) + readable + events_since"),
+            (
+                "events_omitted_count",
+                "event log (cursor) + readable + events_since",
+            ),
+            ("events_since", "events_since"),
+            (
+                "events_sealed_cursor",
+                "event log (cursor) + readable + events_since",
+            ),
+            ("registry", "trust digest"),
+            ("revocations", "trust digest"),
+            ("scope_revocations", "trust digest"),
+            ("revocation_history", "event log (cursor) + trust digest"),
+            (
+                "lifecycle_admissions",
+                "event log (cursor) + trust digest + readable + lifecycle-refusal mark",
+            ),
+            ("relaxations", "relaxations rows in the key"),
+            ("certificates", "certificate rows in the key"),
+            ("content_digest", "the digest itself"),
+        ];
+        let (service, _) = service_with_a_ruling();
+        let full = snapshot_with(&service, &service.state, &[("nonce", "guard")]);
+        let trust = trust::load(&service.db, &service.root.public()).unwrap();
+        let freshness: BTreeSet<String> = snapshot_freshness(
+            &service.db,
+            &service.state,
+            &trust,
+            "guard",
+            &crate::time::now_rfc3339_millis(),
+        )
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+        let classified: BTreeSet<String> = CONTENT
+            .iter()
+            .map(|(field, _)| (*field).to_owned())
+            .chain(freshness.iter().cloned())
+            .chain(["signer".to_owned(), "signature".to_owned()])
+            .collect();
+        let fields: BTreeSet<String> = full.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            fields.difference(&classified).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "a snapshot field is neither freshness nor covered by the content memo key; \
+             add what it depends on to the key in snapshot(), then classify it here"
+        );
+        assert_eq!(
+            classified.difference(&fields).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "a classified field is no longer in the snapshot; drop it from this list"
+        );
+    }
+
+    #[test]
     fn an_approved_proposal_waits_for_a_steward_and_is_admitted_once_authorized() {
         let service = service("");
         let steward = auth(&service, "facts-one");
@@ -4950,5 +5601,368 @@ nonce_retention_seconds = 1300
         .unwrap();
         assert_eq!(historical["status"], "committed");
         assert_eq!(historical["historical_receipt"], true);
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::crypto::PrivateKey;
+
+    const TOKEN: &str = "facts-usage";
+    /// Planted in a path identifier and a query value: neither may reach a
+    /// usage row.
+    const CANARY: &str = "Wilhelmina0xCANARY";
+
+    fn service(temp: &std::path::Path) -> ServiceState {
+        let token_path = temp.join("facts.token");
+        crate::crypto::write_0600(&token_path, TOKEN.as_bytes(), "facts token").unwrap();
+        let config = ServiceConfig {
+            allow_non_loopback: false,
+            path: temp.join("kinbased.toml"),
+            company_id: "usage".to_owned(),
+            sqlite_path: temp.join("company.sqlite"),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            root_key_file: temp.join("root.key"),
+            facts_token_file: token_path,
+            directory_token_file: None,
+            admin_token_file: None,
+            authority_token_file: None,
+            auth_failures_per_minute: 50,
+            default_fact_freshness_seconds: 900,
+            candidate_lifetime_seconds: 900,
+            clock_skew_seconds: 300,
+            nonce_retention_seconds: 1300,
+            read_volume_per_hour: 2_000,
+            read_bytes_per_hour: 64 * 1024 * 1024,
+            requests_per_minute: 600,
+            revocation_freshness_seconds: 900,
+            directory_retention_seconds: 365 * 24 * 3600,
+            record_usage: true,
+            usage_retention_seconds: 30 * 24 * 3600,
+            facts_token_scopes: Vec::new(),
+        };
+        let db = CompanyDb::open(&config.sqlite_path).unwrap();
+        register_tokens(&db, &config).unwrap();
+        ServiceState {
+            config,
+            root: PrivateKey::generate(),
+            started_at: crate::time::now_rfc3339_millis(),
+            views: Default::default(),
+            snapshots: Default::default(),
+        }
+    }
+
+    /// A request as `http::read_request` would hand it over, signed by `key`
+    /// when `bearer` is given.
+    fn request(
+        method: &str,
+        target: &str,
+        body: &[u8],
+        bearer: Option<&str>,
+        key: &PrivateKey,
+    ) -> Request {
+        let (route, query_text) = target.split_once('?').unwrap_or((target, ""));
+        let query = query_text
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (key.to_owned(), value.to_owned())
+            })
+            .collect();
+        let mut headers = vec![("host".to_owned(), "127.0.0.1:8421".to_owned())];
+        if !body.is_empty() {
+            headers.push(("content-type".to_owned(), "application/json".to_owned()));
+        }
+        if let Some(bearer) = bearer {
+            let nonce = crate::crypto::random_token();
+            let expires_at =
+                crate::time::plus_seconds(&crate::time::now_rfc3339_millis(), 60).unwrap();
+            let signed = json!({
+                "method": method,
+                "path": target,
+                "body_sha256": crate::hash::sha256_bytes(body),
+                "nonce": nonce,
+                "expires_at": expires_at
+            });
+            let signature = key
+                .sign("receipt", &crate::json::canonical_bytes(&signed))
+                .unwrap();
+            headers.extend([
+                ("authorization".to_owned(), format!("Bearer {bearer}")),
+                ("x-kinbase-nonce".to_owned(), nonce),
+                ("x-kinbase-expires-at".to_owned(), expires_at),
+                ("x-kinbase-client-key".to_owned(), key.public().to_hex()),
+                ("x-kinbase-signature".to_owned(), signature),
+            ]);
+        }
+        Request {
+            method: method.to_owned(),
+            path: target.to_owned(),
+            route: route.to_owned(),
+            query,
+            headers,
+            body: body.to_vec(),
+            peer: None,
+        }
+    }
+
+    /// `handle_connection` without the socket: the answer, then its row.
+    fn served(state: &ServiceState, request: &Request) -> Handled {
+        let mut usage = None;
+        let answer = handle(state, request, &mut usage);
+        if let Some(usage) = usage {
+            usage.write();
+        }
+        answer
+    }
+
+    /// Every usage row as (principal, client, role, action, target, status,
+    /// error code), oldest first.
+    fn rows(
+        state: &ServiceState,
+    ) -> Vec<(String, String, String, String, String, u16, Option<String>)> {
+        let db = CompanyDb::connect(&state.config.sqlite_path).unwrap();
+        let mut statement = db
+            .connection
+            .prepare("SELECT principal_id, client, token_role, action, target, status, error_code FROM usage_events ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_authenticated_request_leaves_one_row_naming_its_principal_and_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = service(temp.path());
+        let key = PrivateKey::generate();
+        let (status, _) =
+            served(&state, &request("GET", "/status", b"", Some(TOKEN), &key)).unwrap();
+        assert_eq!(status, 200);
+        let client: String = key.public().to_hex().chars().take(16).collect();
+        assert_eq!(
+            rows(&state),
+            [(
+                "facts-principal".to_owned(),
+                client,
+                "facts".to_owned(),
+                "info.status".to_owned(),
+                "/status".to_owned(),
+                200,
+                None
+            )]
+        );
+    }
+
+    #[test]
+    fn a_refused_request_is_recorded_with_its_closed_error_code() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = service(temp.path());
+        let key = PrivateKey::generate();
+        // The facts token holds no admin:issue scope.
+        let body = br#"{"principal_id":"someone","scopes":["facts:read"]}"#;
+        let (status, error) =
+            served(&state, &request("POST", "/tokens", body, Some(TOKEN), &key)).unwrap_err();
+        let recorded = rows(&state);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].3, "token.issue");
+        assert_eq!(recorded[0].5, status);
+        assert_eq!(recorded[0].6.as_deref(), Some(error.code.as_str()));
+
+        // A body that does not parse is still the action its route names.
+        let (status, _) = served(
+            &state,
+            &request("POST", "/facts", b"{not json", Some(TOKEN), &key),
+        )
+        .unwrap_err();
+        assert_eq!(status, 400);
+        let recorded = rows(&state);
+        assert_eq!(
+            (recorded[1].3.as_str(), recorded[1].5),
+            ("fact.create", 400)
+        );
+    }
+
+    #[test]
+    fn a_request_refused_at_the_rate_ceiling_writes_no_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = service(temp.path());
+        state.config.requests_per_minute = 1;
+        let key = PrivateKey::generate();
+        // Both requests land in one minute unless the clock rolls over
+        // between them, in which case neither is refused; skip that run.
+        let minute = now_minute();
+        let first = served(&state, &request("GET", "/status", b"", Some(TOKEN), &key));
+        let second = served(&state, &request("GET", "/status", b"", Some(TOKEN), &key));
+        if now_minute() != minute {
+            return;
+        }
+        assert!(first.is_ok());
+        let (status, _) = second.unwrap_err();
+        assert_eq!(status, 429);
+        assert_eq!(rows(&state).len(), 1, "a refused request grew the table");
+    }
+
+    #[test]
+    fn a_service_that_does_not_record_usage_writes_no_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = service(temp.path());
+        state.config.record_usage = false;
+        let key = PrivateKey::generate();
+        assert!(served(&state, &request("GET", "/status", b"", Some(TOKEN), &key)).is_ok());
+        assert!(rows(&state).is_empty());
+    }
+
+    #[test]
+    fn a_write_maintenance_refuses_keeps_the_action_its_body_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = service(temp.path());
+        let key = PrivateKey::generate();
+        let db = CompanyDb::connect(&state.config.sqlite_path).unwrap();
+        db.connection.execute_batch("DROP TABLE nonces").unwrap();
+        let body = br#"{"supersedes":["fact-1"]}"#;
+        let (status, _) =
+            served(&state, &request("POST", "/facts", body, Some(TOKEN), &key)).unwrap_err();
+        assert_eq!(status, 500);
+        assert_eq!(
+            rows(&state)
+                .iter()
+                .map(|row| (row.3.as_str(), row.5))
+                .collect::<Vec<_>>(),
+            [("fact.update", 500)]
+        );
+    }
+
+    #[test]
+    fn a_usage_row_that_cannot_be_written_changes_nothing_the_caller_sees() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = service(temp.path());
+        let key = PrivateKey::generate();
+        let recorded = served(&state, &request("GET", "/status", b"", Some(TOKEN), &key));
+        let db = CompanyDb::connect(&state.config.sqlite_path).unwrap();
+        db.connection
+            .execute_batch("DROP TABLE usage_events")
+            .unwrap();
+        let unrecorded = served(&state, &request("GET", "/status", b"", Some(TOKEN), &key));
+        assert_eq!(unrecorded.unwrap(), recorded.unwrap());
+    }
+
+    #[test]
+    fn a_row_that_cannot_get_the_write_lock_is_dropped_without_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = service(temp.path());
+        let key = PrivateKey::generate();
+        let mut usage = None;
+        let request = request("GET", "/status", b"", Some(TOKEN), &key);
+        assert!(handle(&state, &request, &mut usage).is_ok());
+        let holder = CompanyDb::connect(&state.config.sqlite_path).unwrap();
+        holder.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        usage
+            .expect("an authenticated request leaves a row")
+            .write();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the row waited out the store's full busy timeout"
+        );
+        holder.connection.execute_batch("ROLLBACK").unwrap();
+        assert!(rows(&state).is_empty());
+    }
+
+    #[test]
+    fn a_principal_that_breaks_the_text_rule_is_never_issued() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = service(temp.path());
+        let admin = temp.path().join("admin.token");
+        crate::crypto::write_0600(&admin, b"admin-usage", "administrative token").unwrap();
+        state.config.admin_token_file = Some(admin);
+        let db = CompanyDb::connect(&state.config.sqlite_path).unwrap();
+        register_tokens(&db, &state.config).unwrap();
+        let key = PrivateKey::generate();
+        // Every string in a request body meets the text rule before the
+        // route reads it, so no issued principal can be one a usage row
+        // refuses.
+        let newline = br#"{"principal_id":"ana\nbo","scopes":["facts:read"]}"#;
+        let request_with =
+            |body: &[u8]| request("POST", "/tokens", body, Some("admin-usage"), &key);
+        let (status, _) = served(&state, &request_with(newline)).unwrap_err();
+        assert_eq!(status, 400);
+        let plain = br#"{"principal_id":"ana","scopes":["facts:read"]}"#;
+        let (status, _) = served(&state, &request_with(plain)).unwrap();
+        assert_eq!(status, 201);
+    }
+
+    #[test]
+    fn an_unauthenticated_request_leaves_no_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = service(temp.path());
+        let key = PrivateKey::generate();
+        for (target, bearer) in [
+            ("/facts", None),
+            ("/status", None),
+            ("/facts", Some("guess")),
+        ] {
+            assert!(served(&state, &request("GET", target, b"", bearer, &key)).is_err());
+        }
+        assert!(
+            rows(&state).is_empty(),
+            "a refused peer drove a usage write"
+        );
+    }
+
+    #[test]
+    fn path_identifiers_and_query_text_never_reach_a_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = service(temp.path());
+        let key = PrivateKey::generate();
+        for target in [
+            format!("/facts/{CANARY}?decision={CANARY}"),
+            format!("/questions/{CANARY}"),
+            format!("/{CANARY}"),
+            format!("/facts?authority_scope={CANARY}"),
+        ] {
+            let _ = served(&state, &request("GET", &target, b"", Some(TOKEN), &key));
+        }
+        let recorded = rows(&state);
+        let actions: Vec<_> = recorded
+            .iter()
+            .map(|row| (row.3.as_str(), row.4.as_str()))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("fact.read", "/facts/{fact_id}"),
+                ("question.read", "/questions/{question_id}"),
+                ("request.unrouted", "unrouted"),
+                ("fact.list", "/facts"),
+            ]
+        );
+        let db = CompanyDb::connect(&state.config.sqlite_path).unwrap();
+        let leaked: i64 = db
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE instr(principal_id || client || token_role || action || target || COALESCE(error_code, ''), ?1) > 0",
+                rusqlite::params![CANARY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "a caller's path or query text reached a usage row"
+        );
     }
 }

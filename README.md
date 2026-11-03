@@ -250,6 +250,20 @@ This is the same `secret_mask` behaviour Kindex and signet-eval implement.
 
 ## Building and running
 
+With Nix flakes enabled:
+
+```
+nix develop                 # Rust toolchain from Cargo.toml
+nix build                   # Build the kinbase package
+./result/bin/kinbase --help
+```
+
+The flake uses [rust-overlay](https://github.com/oxalica/rust-overlay) for the
+Rust toolchain. `flake.lock` pins the Nix inputs, while `Cargo.lock` pins Rust
+dependencies.
+
+Without Nix:
+
 ```
 cargo build --release --offline --locked
 ./target/release/kinbase --help

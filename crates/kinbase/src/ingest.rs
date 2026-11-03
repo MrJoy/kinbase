@@ -689,9 +689,16 @@ pub fn ingest(
         )?;
     }
 
-    // -- derive facts from the whole ledger ------------------------------------
+    // -- derive facts for what this run reported -------------------------------
+    // Each cohort derives from its own rows alone, so only the cohorts of the
+    // reported observations are read: the whole ledger was 0.9 s and 535 MB
+    // per run at 130,000 observations, to report on a handful.
     let trust_facts = crate::repository::trust_facts(launcher, trust.as_ref());
-    let ledger = private.all_observations()?;
+    let cohorts: std::collections::BTreeSet<String> = reported
+        .iter()
+        .map(crate::lifecycle::derivation_key)
+        .collect();
+    let ledger = private.observations_in_cohorts(&cohorts)?;
     let derived = crate::lifecycle::derive(&ledger, &trust_facts, &now);
     let reported_ids: std::collections::BTreeSet<String> = reported
         .iter()
@@ -754,10 +761,7 @@ pub fn ingest(
     } else {
         0
     };
-    let adapter_receipt_count = ledger
-        .iter()
-        .filter(|observation| observation.source_kind == source_kind)
-        .count();
+    let adapter_receipt_count = private.observation_count_for_kind(source_kind)?;
     let mut result = json!({
         "status": "ingested",
         "adapter": source_kind,
@@ -1248,24 +1252,40 @@ fn adopt_legacy_identities(
     repository_id: Option<&str>,
     scanned: Option<&std::collections::BTreeSet<(String, String)>>,
 ) -> Result<Value, ContractError> {
+    // Once a source's rows have moved, its older spellings hold nothing:
+    // ask each whether it does before reading anything, rather than reading
+    // every row of the source at every ingest to find nothing to move.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut legacy = Vec::new();
+    for (candidate, unambiguous) in candidates {
+        if candidate == current || !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if private.source_has_observations(candidate)? {
+            legacy.push((candidate, *unambiguous));
+        }
+    }
+    let mut adopted = 0usize;
+    let mut merged = 0usize;
+    let mut left_with_another_repository = 0usize;
+    if legacy.is_empty() {
+        return Ok(json!({
+            "adopted": adopted,
+            "merged_duplicates": merged,
+            "left_with_another_repository": left_with_another_repository
+        }));
+    }
     let mut held: std::collections::BTreeSet<(String, String)> = private
         .observations_for_source(current)?
         .into_iter()
         .map(|row| (row.native_id, row.content_digest))
         .collect();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut adopted = 0usize;
-    let mut merged = 0usize;
-    let mut left_with_another_repository = 0usize;
-    for (candidate, unambiguous) in candidates {
-        if candidate == current || !seen.insert(candidate.clone()) {
-            continue;
-        }
+    for (candidate, unambiguous) in legacy {
         for mut row in private.observations_for_source(candidate)? {
             let belongs = match (row.repository_id.as_deref(), repository_id) {
                 (Some(row_repository), Some(this)) => row_repository == this,
                 (None, _) => {
-                    *unambiguous
+                    unambiguous
                         || scanned.is_some_and(|keys| {
                             keys.contains(&(row.native_id.clone(), row.content_digest.clone()))
                         })

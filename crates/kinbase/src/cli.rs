@@ -85,6 +85,18 @@ fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
             return match command {
                 CompanyCommand::Init { config } => crate::company::init(&config, json),
                 CompanyCommand::Serve { config } => crate::company::serve(&config, json),
+                CompanyCommand::Usage {
+                    config,
+                    since,
+                    until,
+                    bucket,
+                } => {
+                    let bucket = match bucket {
+                        UsageBucket::Day => crate::usage::Bucket::Day,
+                        UsageBucket::Hour => crate::usage::Bucket::Hour,
+                    };
+                    crate::company::usage(&config, since.as_deref(), until.as_deref(), bucket, json)
+                }
             }
             .map_err(internal);
         }
@@ -113,6 +125,20 @@ fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
         Command::Company(_) => {
             unreachable!("service commands return before the launcher loads")
         }
+        // The sign-in belongs to the Company this invocation selected.
+        Command::Auth(AuthCommand::Login) => {
+            let config = launcher
+                .user
+                .as_ref()
+                .map_or(Ok(None), crate::config::UserConfig::oidc)?
+                .ok_or_else(|| ContractError::invariant("OIDC is not configured"))?;
+            let email = crate::oidc::login(&config, json)?;
+            if json {
+                crate::output::emit(&serde_json::json!({"signed_in_as": email}), true);
+            } else {
+                println!("signed in as {email}");
+            }
+        }
         Command::Repo(RepoCommand::Issue { repo, company }) => {
             crate::repository::issue_certificate(launcher, &repo, &company, json)
                 .map_err(internal)?;
@@ -128,6 +154,19 @@ fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let as_of = resolve_as_of(&launcher, &repo, as_of.as_deref())?;
             crate::repository::status(launcher, &repo, &as_of, json).map_err(internal)?;
+        }
+        Command::Dream { force } => {
+            let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let root = crate::store::ensure_store_root(crate::StoreKind::Personal, &repo)?;
+            let result = crate::dream::dream(&root, force)?;
+            if json {
+                println!("{}", crate::json::canonical_text(&result));
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            }
         }
         Command::Doctor { host, repo } => {
             let repo = repo

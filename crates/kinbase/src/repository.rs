@@ -6,6 +6,7 @@
 
 use crate::codebase::{ParsedEvent, Repository, StoredFile, parse_stored};
 use crate::company::cache::Freshness;
+use crate::company::client::SnapshotRefresh;
 use crate::crypto::PublicKey;
 use crate::error::ContractError;
 use crate::launcher::Launcher;
@@ -1794,18 +1795,41 @@ pub fn build_trust(
             .clone()
             .or_else(|| repo.uuid_hint().map(str::to_owned))
             .unwrap_or_default();
+        let known = cache.known_content_digest(&if asking_as.is_empty() {
+            String::new()
+        } else {
+            format!("repository:{asking_as}")
+        });
         let snapshot = match client.as_ref() {
-            Some(client) => client.snapshot_for(&asking_as),
+            Some(client) => client.refresh_for(&asking_as, known.as_deref()),
             None => Err(ContractError::internal(
                 "an online read has a Company client",
             )),
         };
         match snapshot {
-            Ok(snapshot) => {
+            Ok(refresh) => {
                 trust.company_reachable = Some(true);
-                if let Err(error) = cache.store_snapshot(&snapshot, &company_root, &now) {
+                let stored = match client.as_ref() {
+                    Some(client) => {
+                        store_refresh(client, &mut cache, &asking_as, refresh, &company_root, &now)
+                            .map(|_| ())
+                    }
+                    None => Err(ContractError::internal(
+                        "an online read has a Company client",
+                    )),
+                };
+                if let Err(error) = stored {
                     crate::output::diagnostic("snapshot-refused", serde_json::to_value(&error).unwrap_or_else(|_| json!({"code": "RUN_INTEGRITY_FAILED", "message": "snapshot refusal detail was unreadable", "remediation": "Preserve the receipt.", "retryable": false, "evidence_id": "err_snapshot_refused"})));
                 }
+            }
+            Err(error)
+                if error.is_oidc_token_failure()
+                    && matches!(
+                        error.code.as_str(),
+                        "AUTHORITY_SCOPE_DENIED" | "CONFIG_INVARIANT"
+                    ) =>
+            {
+                return Err(error);
             }
             Err(error) => {
                 trust.company_reachable = Some(false);
@@ -1880,9 +1904,13 @@ pub fn build_trust(
                 );
             }
         }
-        trust.authority_cursor = crate::json::get_str(&snapshot, "authority_cursor")
-            .unwrap_or("0")
-            .to_owned();
+        // The newest verified authority cursor: an unchanged receipt moves it
+        // past the one the stored snapshot names.
+        trust.authority_cursor = cache.meta("authority_cursor").unwrap_or_else(|| {
+            crate::json::get_str(&snapshot, "authority_cursor")
+                .unwrap_or("0")
+                .to_owned()
+        });
     }
     // Certificate: only from the cache, keyed by the config hint.
     if let Some(uuid) = hint_uuid {
@@ -2023,6 +2051,43 @@ pub fn ensure_authority_snapshot(
     ensure_authority_snapshot_for(launcher, "", requested_cursor, as_of)
 }
 
+/// Store what a refresh answered and return the signed document stored. A
+/// receipt the cache can no longer take -- another refresh replaced the
+/// content after this one offered its digest -- is followed by exactly one
+/// full refresh: the client ends up current rather than refused, and nothing
+/// loops.
+pub(crate) fn store_refresh(
+    client: &crate::company::client::Client,
+    cache: &mut crate::company::cache::Cache,
+    repository_uuid: &str,
+    refresh: SnapshotRefresh,
+    root: &PublicKey,
+    now: &str,
+) -> Result<Value, ContractError> {
+    let receipt = match refresh {
+        SnapshotRefresh::Snapshot(snapshot) => {
+            cache.store_snapshot(&snapshot, root, now)?;
+            return Ok(snapshot);
+        }
+        SnapshotRefresh::Unchanged(receipt) => receipt,
+    };
+    match cache.store_unchanged(&receipt, root, now) {
+        Ok(()) => Ok(receipt),
+        Err(error) if error.code == "DIGEST_MISMATCH" => {
+            match client.refresh_for(repository_uuid, None)? {
+                SnapshotRefresh::Snapshot(snapshot) => {
+                    cache.store_snapshot(&snapshot, root, now)?;
+                    Ok(snapshot)
+                }
+                // refresh_for refuses a receipt to a request that offered no
+                // digest; reaching here would mean it did not.
+                SnapshotRefresh::Unchanged(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Ensure the cached snapshot is fresh *and* was selected for this repository.
 /// The service filters a snapshot to the rulings that govern the asking
 /// repository plus company-wide direction; the cache holds one snapshot for
@@ -2071,12 +2136,21 @@ pub fn ensure_authority_snapshot_for(
     {
         return Ok((cached_cursor, "cache"));
     }
-    match company.client.snapshot_for(repository_uuid) {
-        Ok(snapshot) => {
-            company
-                .cache
-                .store_snapshot(&snapshot, &company.root, &now)?;
-            let cursor = crate::json::get_str(&snapshot, "authority_cursor")
+    let known = company.cache.known_content_digest(&wanted_scope);
+    match company
+        .client
+        .refresh_for(repository_uuid, known.as_deref())
+    {
+        Ok(refresh) => {
+            let answer = store_refresh(
+                &company.client,
+                &mut company.cache,
+                repository_uuid,
+                refresh,
+                &company.root,
+                &now,
+            )?;
+            let cursor = crate::json::get_str(&answer, "authority_cursor")
                 .map(str::to_owned)
                 .unwrap_or_else(|| "0".to_owned());
             if requested_cursor.is_some() {
@@ -2092,6 +2166,15 @@ pub fn ensure_authority_snapshot_for(
                 ));
             }
             Ok((cursor, "fetched"))
+        }
+        Err(error)
+            if error.is_oidc_token_failure()
+                && matches!(
+                    error.code.as_str(),
+                    "AUTHORITY_SCOPE_DENIED" | "CONFIG_INVARIANT"
+                ) =>
+        {
+            Err(error)
         }
         Err(error) => {
             if cache_fresh
@@ -2179,7 +2262,11 @@ pub fn issue_certificate(
     // launcher; its URL was validated when the config was read.
     let named = launcher.named_form();
     if !named {
-        crate::config::validate_loopback_url(company_url, allow_non_loopback)?;
+        let gateway = launcher
+            .user
+            .as_ref()
+            .is_some_and(crate::config::UserConfig::gateway_configured);
+        crate::config::validate_loopback_url(company_url, allow_non_loopback, gateway)?;
     }
     if launcher.company_env_present {
         return Err(ContractError::new(
@@ -2211,13 +2298,14 @@ pub fn issue_certificate(
             "Ask the Company steward to issue the certificate, or configure admin_token_file.",
         ));
     };
-    let client = crate::company::client::Client::new(
+    let client = crate::company::client::Client::from_user_config(
         &access.url,
         admin,
         access.client_key()?,
         Some(access.root_key()?),
         access.cache_root.clone(),
         access.allow_non_loopback,
+        launcher.user.as_ref(),
     )?;
     let hint = crate::codebase::git(&repo.root, &["remote", "get-url", "origin"])
         .map(|remote| normalize_hint(&remote))
@@ -2715,7 +2803,10 @@ pub(crate) fn publish_manifest_value(
                 result["company_receipt"] = response.body;
             }
             Ok(response) => {
-                let error = crate::company::client::error_from_response(&response);
+                let error = crate::company::client::error_from_response(
+                    &response,
+                    company.client.oidc.is_some(),
+                );
                 if error.code == "MANIFEST_HEAD_REGRESSION" {
                     return Err(error);
                 }
@@ -4336,10 +4427,23 @@ pub fn doctor(
             }
         }
     }
-    let cache_clocks = launcher
+    let (cache_clocks, cache_freshness_record) = launcher
         .company_cache()?
-        .map(|(cache, _root)| cache.freshness(&now).to_value())
-        .unwrap_or(Value::Null);
+        .map(|(cache, root)| {
+            (
+                cache.freshness(&now).to_value(),
+                cache.freshness_record(&root),
+            )
+        })
+        .unwrap_or((Value::Null, Value::Null));
+    // Stated, never silent: clocks the cache is using that no signed document
+    // vouches for are a cache to refresh, not a fresh cache.
+    if cache_freshness_record.get("verified") == Some(&Value::Bool(false)) {
+        crate::output::diagnostic(
+            "cache-freshness-record-unverified",
+            cache_freshness_record.clone(),
+        );
+    }
     let kindex = crate::adapters::kindex_seam_conformance();
     let mut boundaries = Vec::new();
     if let Some(repo) = &repo {
@@ -4372,6 +4476,7 @@ pub fn doctor(
         "sweep": sweep,
         "sandbox": sandbox,
         "cache_clocks": cache_clocks,
+        "cache_freshness_record": cache_freshness_record,
         "classifier": classifier,
         "classifier_pinned": classifier_pinned,
         "kindex_seams": kindex,

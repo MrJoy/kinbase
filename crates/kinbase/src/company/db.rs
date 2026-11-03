@@ -2,17 +2,34 @@
 //! append-only event table with a monotonic cursor, authority registry,
 //! directory, questions/answers/Unknowns, consumed nonces, tokens with
 //! first-use client-key binding, throttles, certificates, manifest
-//! observations, and fact version history.
+//! observations, fact version history, and append-only usage rows.
 
 use crate::error::ContractError;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const COMPANY_SCHEMA_VERSION: i64 = 2;
 
 pub fn sqlite_error(context: &str) -> impl Fn(rusqlite::Error) -> ContractError + '_ {
     move |error| ContractError::internal(format!("{context}: {error}"))
+}
+
+/// The three outcome columns of a usage breakdown: requests, succeeded and
+/// failed. A refusal is a 4xx and is what remains; a 5xx is the service
+/// failing, counted apart so a maintenance fault does not read as callers
+/// being turned away.
+const USAGE_OUTCOMES: &str =
+    "COUNT(*), COALESCE(SUM(status < 400), 0), COALESCE(SUM(status >= 500), 0)";
+
+/// `(requests, succeeded, refused, failed)` from the `USAGE_OUTCOMES`
+/// columns starting at `first`.
+fn usage_outcomes(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<(i64, i64, i64, i64)> {
+    let requests: i64 = row.get(first)?;
+    let succeeded: i64 = row.get(first + 1)?;
+    let failed: i64 = row.get(first + 2)?;
+    Ok((requests, succeeded, requests - succeeded - failed, failed))
 }
 
 pub struct CompanyDb {
@@ -83,6 +100,30 @@ impl CompanyDb {
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
             )
             .map_err(sqlite_error("pragma"))?;
+        Ok(Self { connection })
+    }
+
+    /// Opens a connection that cannot write, for a reader running beside the
+    /// service against whatever file the config names. `connect` would switch
+    /// a foreign file's journal mode before anyone checked what it was.
+    pub fn connect_read_only(path: &Path) -> Result<Self, ContractError> {
+        crate::paths::reject_symlink(path, "Company SQLite")?;
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            ContractError::refused(
+                "CONFIG_INVARIANT",
+                format!("Company SQLite cannot be opened ({error})"),
+                format!("Make {} readable by this user.", path.display()),
+            )
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(sqlite_error("busy timeout"))?;
         Ok(Self { connection })
     }
 
@@ -172,7 +213,18 @@ impl CompanyDb {
                  CREATE TABLE IF NOT EXISTS metrics(name TEXT PRIMARY KEY, count INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS authority_calls(
                     task_id TEXT NOT NULL, arm TEXT NOT NULL, seed TEXT NOT NULL, count INTEGER NOT NULL,
-                    PRIMARY KEY(task_id, arm, seed));",
+                    PRIMARY KEY(task_id, arm, seed));
+                 CREATE TABLE IF NOT EXISTS usage_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL,
+                    principal_id TEXT NOT NULL, client TEXT NOT NULL, token_role TEXT NOT NULL,
+                    action TEXT NOT NULL, target TEXT NOT NULL, status INTEGER NOT NULL,
+                    error_code TEXT, duration_ms INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS usage_events_recorded_at ON usage_events(recorded_at);
+                 CREATE TRIGGER IF NOT EXISTS usage_events_immutable_update BEFORE UPDATE ON usage_events
+                    BEGIN SELECT RAISE(ABORT, 'usage records are append-only'); END;
+                 CREATE TRIGGER IF NOT EXISTS usage_events_immutable_delete BEFORE DELETE ON usage_events
+                    WHEN OLD.recorded_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')
+                    BEGIN SELECT RAISE(ABORT, 'usage records younger than a day are append-only'); END;",
             )
             .map_err(sqlite_error("company schema"))?;
         self.connection
@@ -188,6 +240,17 @@ impl CompanyDb {
             )
             .map_err(sqlite_error("revocation cursor"))?;
         Ok(())
+    }
+
+    /// Whether the store holds a table named `name`.
+    pub fn has_table(&self, name: &str) -> Result<bool, ContractError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error("schema lookup"))
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>, ContractError> {
@@ -277,6 +340,38 @@ impl CompanyDb {
             .map_err(sqlite_error("prepare"))?;
         let rows = statement
             .query_map(params![kind], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sqlite_error("query"))?;
+        let mut output = Vec::new();
+        for row in rows {
+            let (cursor, payload, verification) = row.map_err(sqlite_error("row"))?;
+            let value: Value = serde_json::from_str(&payload)
+                .map_err(|error| ContractError::internal(error.to_string()))?;
+            output.push((cursor, value, verification));
+        }
+        Ok(output)
+    }
+
+    /// The events at these cursors, parsed as `events_of_kind` parses them:
+    /// a snapshot window loads only the rows it sends.
+    pub fn events_at(&self, cursors: &[i64]) -> Result<Vec<(i64, Value, String)>, ContractError> {
+        if cursors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; cursors.len()].join(",");
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT cursor, payload, verification FROM events WHERE cursor IN ({placeholders})"
+            ))
+            .map_err(sqlite_error("prepare"))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(cursors.iter()), |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1110,6 +1205,32 @@ impl CompanyDb {
         Ok(next)
     }
 
+    /// Row count, newest cursor and retained count of the fact-version index.
+    /// Rows are written after their event is appended, so the event cursor
+    /// alone does not say whether a version row has landed; `retained` is
+    /// published in snapshots, so a change to it must change the mark too.
+    pub fn fact_versions_mark(&self) -> Result<(i64, i64, i64), ContractError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(cursor), 0), COALESCE(SUM(retained), 0) FROM fact_versions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(sqlite_error("fact versions mark"))
+    }
+
+    /// Row count and newest id of one kind of audit record. Audit rows are
+    /// insert-only and append no event.
+    pub fn audit_mark(&self, kind: &str) -> Result<(i64, i64), ContractError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM audit WHERE kind=?1",
+                params![kind],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sqlite_error("audit mark"))
+    }
+
     pub fn fact_versions(&self, fact_id: &str) -> Result<Vec<Value>, ContractError> {
         let mut statement = self
             .connection
@@ -1271,6 +1392,312 @@ impl CompanyDb {
             map.insert(name, Value::from(count));
         }
         Ok(Value::Object(map))
+    }
+
+    // ----- usage -----
+
+    /// Append one usage row (`crate::usage`). Every string is refused unless
+    /// it meets the canonical text rule; a writer never stores a folded or
+    /// empty stand-in.
+    ///
+    /// The row commits with `synchronous=NORMAL`: in WAL mode that is a page
+    /// write rather than a disk flush, and a request already pays three FULL
+    /// commits for its nonce, client pair and rate counter. A usage row lost
+    /// to a power cut costs a count, never an authority or a receipt, so it
+    /// does not get to double the request's flush cost.
+    pub fn append_usage(&self, event: &crate::usage::UsageEvent) -> Result<(), ContractError> {
+        for (field, value) in [
+            ("recorded_at", event.recorded_at.as_str()),
+            ("principal_id", event.principal_id.as_str()),
+            ("client", event.client.as_str()),
+            ("token_role", event.token_role.as_str()),
+            ("action", event.action),
+            ("target", event.target),
+            (
+                "error_code",
+                event.error_code.as_deref().unwrap_or_default(),
+            ),
+        ] {
+            crate::json::validate_text(value).map_err(|reason| {
+                ContractError::invariant(format!("usage {field} breaks the text rule ({reason})"))
+            })?;
+        }
+        self.connection
+            .execute_batch("PRAGMA synchronous=NORMAL")
+            .map_err(sqlite_error("usage synchronous"))?;
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT INTO usage_events(recorded_at, principal_id, client, token_role, action, target, status, error_code, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    event.recorded_at,
+                    event.principal_id,
+                    event.client,
+                    event.token_role,
+                    event.action,
+                    event.target,
+                    event.status,
+                    event.error_code,
+                    i64::try_from(event.duration_ms).unwrap_or(i64::MAX)
+                ],
+            )
+            .map(|_| ())
+            .map_err(sqlite_error("usage"));
+        // The connection may serve another write; it goes back to FULL even
+        // when the insert failed. A failed restore is reported on its own:
+        // folded into the result it turned a row that was stored into a
+        // `usage-record-failed` report.
+        if let Err(error) = self
+            .connection
+            .execute_batch("PRAGMA synchronous=FULL")
+            .map_err(sqlite_error("usage synchronous"))
+        {
+            crate::output::diagnostic(
+                "usage-synchronous-restore-failed",
+                json!({"code": error.code}),
+            );
+        }
+        inserted
+    }
+
+    /// Deletes up to a thousand usage rows recorded before `before`, oldest
+    /// first, once the oldest was recorded before `due`. The check is one
+    /// index read, so a store with nothing due takes no write lock, and the
+    /// batch bounds how long a backlog holds it.
+    pub fn prune_usage(&self, before: &str, due: &str) -> Result<usize, ContractError> {
+        let oldest: Option<String> = self
+            .connection
+            .query_row("SELECT MIN(recorded_at) FROM usage_events", [], |row| {
+                row.get(0)
+            })
+            .map_err(sqlite_error("usage prune"))?;
+        if oldest.is_none_or(|oldest| oldest.as_str() >= due) {
+            return Ok(0);
+        }
+        self.connection
+            .execute(
+                "DELETE FROM usage_events WHERE id IN (
+                    SELECT id FROM usage_events WHERE recorded_at < ?1 ORDER BY recorded_at LIMIT 1000)",
+                params![before],
+            )
+            .map_err(sqlite_error("usage prune"))
+    }
+
+    /// Aggregates over the usage rows inside `window`, one query per
+    /// breakdown so the counting happens in SQLite rather than in memory.
+    ///
+    /// The queries share one read transaction. The service keeps appending
+    /// while a report runs, and without a shared WAL snapshot a row committed
+    /// between the totals and a breakdown showed up in one and not the other.
+    pub fn usage_summary(
+        &self,
+        window: &crate::usage::Window,
+        bucket: crate::usage::Bucket,
+    ) -> Result<crate::usage::Summary, ContractError> {
+        self.connection
+            .execute_batch("BEGIN")
+            .map_err(sqlite_error("usage snapshot"))?;
+        let summary = self.usage_summary_in_snapshot(window, bucket);
+        // Nothing was written, so ending the snapshot either way is the same.
+        let ended = self
+            .connection
+            .execute_batch(if summary.is_ok() {
+                "COMMIT"
+            } else {
+                "ROLLBACK"
+            })
+            .map_err(sqlite_error("usage snapshot"));
+        let summary = summary?;
+        ended?;
+        Ok(summary)
+    }
+
+    fn usage_summary_in_snapshot(
+        &self,
+        window: &crate::usage::Window,
+        bucket: crate::usage::Bucket,
+    ) -> Result<crate::usage::Summary, ContractError> {
+        // Only the bounds the window has go into the query: `?1 IS NULL OR
+        // recorded_at >= ?1` kept SQLite off the recorded_at index, so even a
+        // narrow window scanned all history once per breakdown.
+        let mut bounds = Vec::new();
+        let mut values = Vec::new();
+        for (operator, value) in [(">=", &window.since), ("<", &window.until)] {
+            if let Some(value) = value {
+                values.push(value.as_str());
+                bounds.push(format!("recorded_at {operator} ?{}", values.len()));
+            }
+        }
+        let from = if bounds.is_empty() {
+            "FROM usage_events".to_owned()
+        } else {
+            format!("FROM usage_events WHERE {}", bounds.join(" AND "))
+        };
+        let bound = || rusqlite::params_from_iter(values.iter());
+        let totals = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT {USAGE_OUTCOMES}, COUNT(DISTINCT principal_id), COUNT(DISTINCT client),
+                            MIN(recorded_at), MAX(recorded_at)
+                     {from}"
+                ),
+                bound(),
+                |row| {
+                    let (requests, succeeded, refused, failed) = usage_outcomes(row, 0)?;
+                    Ok(json!({
+                        "requests": requests,
+                        "succeeded": succeeded,
+                        "refused": refused,
+                        "failed": failed,
+                        "principals": row.get::<_, i64>(3)?,
+                        "clients": row.get::<_, i64>(4)?,
+                        "first_at": row.get::<_, Option<String>>(5)?,
+                        "last_at": row.get::<_, Option<String>>(6)?
+                    }))
+                },
+            )
+            .map_err(sqlite_error("usage totals"))?;
+
+        let mut actions_by_principal: BTreeMap<String, serde_json::Map<String, Value>> =
+            BTreeMap::new();
+        for (principal, action, count) in self.usage_rows(
+            &format!(
+                "SELECT principal_id, action, COUNT(*) {from}
+                 GROUP BY principal_id, action"
+            ),
+            bound(),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )? {
+            actions_by_principal
+                .entry(principal)
+                .or_default()
+                .insert(action, Value::from(count));
+        }
+        let by_principal = self
+            .usage_rows(
+                &format!(
+                    "SELECT principal_id, {USAGE_OUTCOMES}, COUNT(DISTINCT client),
+                        MIN(recorded_at), MAX(recorded_at)
+                 {from}
+                 GROUP BY principal_id ORDER BY COUNT(*) DESC, principal_id"
+                ),
+                bound(),
+                |row| {
+                    let (requests, succeeded, refused, failed) = usage_outcomes(row, 1)?;
+                    Ok(json!({
+                        "principal_id": row.get::<_, String>(0)?,
+                        "requests": requests,
+                        "succeeded": succeeded,
+                        "refused": refused,
+                        "failed": failed,
+                        "clients": row.get::<_, i64>(4)?,
+                        "first_at": row.get::<_, String>(5)?,
+                        "last_at": row.get::<_, String>(6)?
+                    }))
+                },
+            )?
+            .into_iter()
+            .map(|mut row| {
+                let principal = row["principal_id"].as_str().unwrap_or_default().to_owned();
+                row["actions"] =
+                    Value::Object(actions_by_principal.remove(&principal).unwrap_or_default());
+                row
+            })
+            .collect();
+        let by_client = self.usage_rows(
+            &format!(
+                "SELECT principal_id, client, token_role, COUNT(*), MAX(recorded_at)
+                 {from}
+                 GROUP BY principal_id, client, token_role ORDER BY COUNT(*) DESC, principal_id, client"
+            ),
+            bound(),
+            |row| {
+                Ok(json!({
+                    "principal_id": row.get::<_, String>(0)?,
+                    "client": row.get::<_, String>(1)?,
+                    "token_role": row.get::<_, String>(2)?,
+                    "requests": row.get::<_, i64>(3)?,
+                    "last_at": row.get::<_, String>(4)?
+                }))
+            },
+        )?;
+        // Rounded, not truncated: integer division showed most fast actions
+        // as 0 ms.
+        let by_action = self.usage_rows(
+            &format!(
+                "SELECT action, {USAGE_OUTCOMES}, COUNT(DISTINCT principal_id),
+                        CAST(ROUND(AVG(duration_ms)) AS INTEGER)
+                 {from}
+                 GROUP BY action ORDER BY COUNT(*) DESC, action"
+            ),
+            bound(),
+            |row| {
+                let (requests, succeeded, refused, failed) = usage_outcomes(row, 1)?;
+                Ok(json!({
+                    "action": row.get::<_, String>(0)?,
+                    "requests": requests,
+                    "succeeded": succeeded,
+                    "refused": refused,
+                    "failed": failed,
+                    "principals": row.get::<_, i64>(4)?,
+                    "mean_duration_ms": row.get::<_, i64>(5)?
+                }))
+            },
+        )?;
+        // The prefix length comes from the closed `Bucket`, never the caller.
+        let by_window = self.usage_rows(
+            &format!(
+                "SELECT substr(recorded_at, 1, {}) AS bucket, {USAGE_OUTCOMES},
+                        COUNT(DISTINCT principal_id)
+                 {from}
+                 GROUP BY bucket ORDER BY bucket",
+                bucket.prefix_len()
+            ),
+            bound(),
+            |row| {
+                let (requests, succeeded, refused, failed) = usage_outcomes(row, 1)?;
+                Ok(json!({
+                    "window": row.get::<_, String>(0)?,
+                    "requests": requests,
+                    "succeeded": succeeded,
+                    "refused": refused,
+                    "failed": failed,
+                    "principals": row.get::<_, i64>(4)?
+                }))
+            },
+        )?;
+        Ok(crate::usage::Summary {
+            totals,
+            by_principal,
+            by_client,
+            by_action,
+            by_window,
+        })
+    }
+
+    fn usage_rows<T>(
+        &self,
+        sql: &str,
+        parameters: impl rusqlite::Params,
+        map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, ContractError> {
+        let mut statement = self
+            .connection
+            .prepare(sql)
+            .map_err(sqlite_error("prepare usage"))?;
+        let rows = statement
+            .query_map(parameters, map)
+            .map_err(sqlite_error("query usage"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error("usage rows"))
     }
 
     pub fn authority_call_count(

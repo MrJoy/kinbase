@@ -12,6 +12,7 @@ use crate::error::ContractError;
 use crate::private::PrivateStore;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[derive(Clone)]
 pub struct Launcher {
@@ -33,7 +34,8 @@ pub struct CompanyAccess {
 
 impl Launcher {
     /// Load configuration and attest descriptors. Any inherited Personal or
-    /// non-allowlisted descriptor refuses here, before shared work.
+    /// non-allowlisted descriptor refuses here, before shared work. The first
+    /// load in a process attests; later loads reuse that launch-time record.
     pub fn load() -> Result<Self, ContractError> {
         let mut user = crate::config::load_user_config()?;
         let selection = match user.as_mut() {
@@ -41,7 +43,17 @@ impl Launcher {
             None => crate::selection::Outcome::Single,
         };
         let personal_root = user.as_ref().map(|user| user.personal.data_root.clone());
-        let fd_attestation = crate::sandbox::attest_descriptors(personal_root.as_deref())?;
+        // Inherited descriptors are fixed at launch. A later load in the same
+        // process would also see descriptors the process opened itself (macOS
+        // keeps two open after loading the native TLS roots), so attest once.
+        static ATTESTATION: OnceLock<Value> = OnceLock::new();
+        let fd_attestation = match ATTESTATION.get() {
+            Some(attestation) => attestation.clone(),
+            None => {
+                let attestation = crate::sandbox::attest_descriptors(personal_root.as_deref())?;
+                ATTESTATION.get_or_init(|| attestation).clone()
+            }
+        };
         let shared = match &user {
             Some(user) => user.shared()?,
             None => crate::config::codebase_only_shared(),
@@ -241,14 +253,16 @@ impl Launcher {
         };
         let root = access.root_key()?;
         let cache = Cache::open(&access.cache_root)?;
-        let client = Client::new(
+        let client = Client::from_user_config(
             &access.url,
             access.facts_token.clone(),
             access.client_key()?,
             Some(root.clone()),
             access.cache_root.clone(),
             access.allow_non_loopback,
-        )?;
+            self.user.as_ref(),
+        )?
+        .with_snapshot_timeout_seconds(access.snapshot_timeout_seconds);
         Ok(Some(CompanyAccess {
             client,
             cache,
@@ -282,9 +296,14 @@ impl Launcher {
             .company
             .as_ref()
             .and_then(|access| {
-                crate::http::parse_url(&access.url, access.allow_non_loopback).ok()
+                crate::http::parse_url(
+                    &access.url,
+                    access.allow_non_loopback,
+                    self.user.as_ref().is_some_and(UserConfig::oidc_configured),
+                )
+                .ok()
             })
-            .map(|(_, port, _)| port)
+            .map(|(_, _, port, _)| port)
     }
 
     /// Capability report for `doctor` (cli.md: every process reports its
@@ -364,4 +383,41 @@ fn read_lines(path: &std::path::Path, role: &str) -> Result<Vec<String>, Contrac
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Launcher;
+
+    // Runs the loads in a fresh child of this test binary, under a temp HOME and
+    // XDG dirs, so sibling tests' descriptors and the live config play no part.
+    #[test]
+    fn a_later_load_ignores_descriptors_the_process_opened() {
+        if std::env::var_os("KINBASE_RELOAD_PROBE").is_some() {
+            // A sibling test can leak a descriptor into this child mid-spawn; start
+            // clean, as a launch would.
+            for fd in 3..1024 {
+                // SAFETY: closing integer descriptors has no memory-safety preconditions.
+                unsafe { libc::close(fd) };
+            }
+            Launcher::load().expect("first load at a clean start");
+            let _open = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .expect("open Cargo.toml");
+            if let Err(error) = Launcher::load() {
+                panic!("second load: {error}");
+            }
+            return;
+        }
+        let home = tempfile::tempdir().expect("temp HOME");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "launcher::tests::a_later_load_ignores_descriptors_the_process_opened", "--test-threads=1"])
+            .env("KINBASE_RELOAD_PROBE", "1")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the probe");
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
 }

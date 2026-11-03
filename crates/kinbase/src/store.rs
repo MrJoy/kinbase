@@ -60,36 +60,7 @@ pub fn append_record_durable(
     value: &Value,
 ) -> Result<(), ContractError> {
     let root = ensure_store_root(store, repo)?;
-    append_jsonl_with(
-        &root.join(filename),
-        value,
-        Append {
-            durable: true,
-            check_present: true,
-        },
-    )
-}
-
-/// `append_record` for a record that carries an identity minted for this
-/// write (a fresh UUID, a timestamp), so it can never already be in the
-/// ledger and the duplicate check has nothing to find. That check builds its
-/// index in process memory, and a hook is a fresh process: every Stop hashed
-/// the whole checkpoint ledger to append one line (2.6 s at 832 MB).
-pub fn append_fresh_record(
-    store: crate::StoreKind,
-    repo: &Path,
-    filename: &str,
-    value: &Value,
-) -> Result<(), ContractError> {
-    let root = ensure_store_root(store, repo)?;
-    append_jsonl_with(
-        &root.join(filename),
-        value,
-        Append {
-            durable: false,
-            check_present: false,
-        },
-    )
+    append_jsonl_with(&root.join(filename), value, Append { durable: true })
 }
 
 /// Every readable record of `filename`. An unreadable line is skipped and
@@ -170,6 +141,48 @@ pub fn read_records_where(
 ) -> Result<Vec<Value>, ContractError> {
     let root = store_root(store, repo);
     read_jsonl_where(&root.join(filename), keep)
+}
+
+/// The records of `filename` whose `field` holds one of `values`, in ledger
+/// order, looked up in the ledger's identity index (`ledger_index`) rather
+/// than by scanning it. A ledger not indexed by `field`, or an index that
+/// cannot answer, is streamed with `fallback` instead, a line predicate the
+/// caller's exact filter refines either way. Kept lines are parsed and
+/// reported as `read_records_where` does, except that a skipped line's
+/// `position` counts the kept lines, since the index does not number the
+/// ledger's.
+pub fn read_records_tagged(
+    store: crate::StoreKind,
+    repo: &Path,
+    filename: &str,
+    field: &str,
+    values: &[&str],
+    fallback: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<Value>, ContractError> {
+    let path = store_root(store, repo).join(filename);
+    match crate::ledger_index::read_tagged(&path, field, values) {
+        Ok(Some(lines)) => {
+            let mut skipped = crate::output::Skipped::default();
+            let mut output = Vec::with_capacity(lines.len());
+            for (position, line) in lines.iter().enumerate() {
+                match parse_strict_object(line) {
+                    Ok(map) => output.push(Value::Object(map)),
+                    Err(_) => skipped.push(
+                        position + 1,
+                        line.len(),
+                        crate::output::unreadable_reason(line),
+                    ),
+                }
+            }
+            skipped.report(filename);
+            Ok(output)
+        }
+        Ok(None) => read_jsonl_where(&path, fallback),
+        Err(error) => {
+            crate::ledger_index::unavailable(filename, &error, "streamed the ledger instead");
+            read_jsonl_where(&path, fallback)
+        }
+    }
 }
 
 /// Where `needle` first occurs in `haystack`, for marker checks on raw
@@ -395,30 +408,19 @@ fn line_appended(file: &fs::File, path: &Path, canonical: &[u8]) {
 }
 
 pub fn append_jsonl(path: &Path, value: &Value) -> Result<(), ContractError> {
-    append_jsonl_with(
-        path,
-        value,
-        Append {
-            durable: false,
-            check_present: true,
-        },
-    )
+    append_jsonl_with(path, value, Append { durable: false })
 }
 
 /// How `append_jsonl_with` appends: whether it returns only once the line is
-/// on disk, and whether it first looks for the line already being there.
+/// on disk.
 struct Append {
     durable: bool,
-    check_present: bool,
 }
 
 fn append_jsonl_with(
     path: &Path,
     value: &Value,
-    Append {
-        durable,
-        check_present,
-    }: Append,
+    Append { durable }: Append,
 ) -> Result<(), ContractError> {
     if let Some(parent) = path.parent() {
         crate::paths::ensure_private_dir(parent, "record directory")?;
@@ -431,34 +433,47 @@ fn append_jsonl_with(
         .and_then(|bytes| {
             String::from_utf8(bytes).map_err(|_| ContractError::internal("record is not UTF-8"))
         })?;
-    // Ledgers are private: created owner-only whatever the umask, and an
-    // existing one readable by others is narrowed.
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| ContractError::io("append JSONL", error))?;
-    let mode = file
-        .metadata()
-        .map_err(|error| ContractError::io("inspect JSONL", error))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        file.set_permissions(fs::Permissions::from_mode(mode & 0o700))
-            .map_err(|error| ContractError::io("narrow JSONL mode", error))?;
+    let file = open_locked_ledger(path)?;
+    // A ledger of entities is checked by identity against its persisted index
+    // (`ledger_index`), which reads only what was appended since it last
+    // looked; the whole-line check below reads the whole ledger in every
+    // fresh process and misses a record seen again with a new timestamp.
+    if let Some(spec) = crate::ledger_index::spec_for(path) {
+        let ledger = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let unchecked = match crate::ledger_index::append(path, &file, spec, &canonical, || {
+            write_line(&file, path, canonical.as_bytes())
+        }) {
+            Ok(crate::ledger_index::Appended::Present | crate::ledger_index::Appended::Written) => {
+                false
+            }
+            Ok(crate::ledger_index::Appended::Behind) => {
+                crate::ledger_index::behind(&ledger);
+                true
+            }
+            Err(error) => {
+                crate::ledger_index::unavailable(
+                    &ledger,
+                    &error,
+                    "appended without the duplicate check; the dream pass removes a duplicate",
+                );
+                true
+            }
+        };
+        // Nothing was written yet. Without the index, append unchecked: a
+        // duplicate is harmless and the dream pass compacts it, and reading
+        // the whole ledger to look for one is the cost the index removes.
+        if unchecked {
+            write_line(&file, path, canonical.as_bytes())?;
+        }
+        if durable {
+            sync_ledger(&file, path)?;
+        }
+        return Ok(());
     }
-    // One writer at a time from the duplicate check to the write: two hooks
-    // appending the same record otherwise both find it absent. Released when
-    // the file closes.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(ContractError::io(
-            "lock JSONL",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    if check_present && line_present(&file, path, canonical.as_bytes())? {
+    if line_present(&file, path, canonical.as_bytes())? {
         // An earlier attempt may have written the line and failed to sync it;
         // a durable append returns only once the line is on disk.
         if durable {
@@ -466,6 +481,63 @@ fn append_jsonl_with(
         }
         return Ok(());
     }
+    write_line(&file, path, canonical.as_bytes())?;
+    line_appended(&file, path, canonical.as_bytes());
+    if durable {
+        sync_ledger(&file, path)?;
+    }
+    Ok(())
+}
+
+/// The ledger at `path`, open for append and exclusively locked. Ledgers are
+/// private: created owner-only whatever the umask, and an existing one
+/// readable by others is narrowed. One writer at a time from the duplicate
+/// check to the write: two hooks appending the same record otherwise both
+/// find it absent. Released when the file closes.
+///
+/// The dream pass replaces a ledger with its compacted copy while holding the
+/// lock; a writer that opened the old file and waited for the lock would
+/// then append to a file no longer at `path`. So the locked file must still
+/// be the one at `path`, or it is opened again.
+pub(crate) fn open_locked_ledger(path: &Path) -> Result<fs::File, ContractError> {
+    for _ in 0..16 {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| ContractError::io("append JSONL", error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| ContractError::io("inspect JSONL", error))?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(mode & 0o700))
+                .map_err(|error| ContractError::io("narrow JSONL mode", error))?;
+        }
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(ContractError::io(
+                "lock JSONL",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let current = fs::metadata(path).ok();
+        if current.is_some_and(|current| {
+            current.dev() == metadata.dev() && current.ino() == metadata.ino()
+        }) {
+            return Ok(file);
+        }
+    }
+    Err(ContractError::internal(format!(
+        "{} kept being replaced while it was being locked",
+        path.display()
+    )))
+}
+
+/// Append `canonical` as one line of the locked ledger `file`; returns the
+/// offset the record starts at.
+fn write_line(mut file: &fs::File, path: &Path, canonical: &[u8]) -> Result<u64, ContractError> {
     // A write cut short (a full disk, a crash before the page cache reached
     // the disk) leaves a last line with no terminator. Appending straight
     // after it glued the new record onto the torn one and both read back as
@@ -487,15 +559,12 @@ fn append_jsonl_with(
             );
         }
     }
-    line.extend_from_slice(canonical.as_bytes());
+    let offset = length + line.len() as u64;
+    line.extend_from_slice(canonical);
     line.push(b'\n');
     file.write_all(&line)
         .map_err(|error| ContractError::io("write JSONL", error))?;
-    line_appended(&file, path, canonical.as_bytes());
-    if durable {
-        sync_ledger(&file, path)?;
-    }
-    Ok(())
+    Ok(offset)
 }
 
 fn sync_ledger(file: &fs::File, path: &Path) -> Result<(), ContractError> {

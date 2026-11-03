@@ -4,6 +4,8 @@ use std::path::PathBuf;
 #[derive(Debug, Subcommand)]
 pub enum Command {
     #[command(subcommand)]
+    Auth(AuthCommand),
+    #[command(subcommand)]
     Company(CompanyCommand),
     #[command(subcommand)]
     Repo(RepoCommand),
@@ -21,6 +23,13 @@ pub enum Command {
         host: Option<Host>,
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// Compact the Personal ledgers by identity and bring their index up to
+    /// date, off the hook path. SessionEnd starts one when it is due.
+    Dream {
+        /// Dream even when one finished within the day.
+        #[arg(long)]
+        force: bool,
     },
     Ingest {
         source_kind: String,
@@ -100,6 +109,11 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    Login,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum CompanyCommand {
     Init {
         #[arg(long)]
@@ -109,6 +123,26 @@ pub enum CompanyCommand {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Summarize who has used the Company service, how, and how much:
+    /// totals and breakdowns by principal, client, action and time window.
+    Usage {
+        #[arg(long)]
+        config: PathBuf,
+        /// Window start (inclusive), RFC 3339 UTC with millisecond precision.
+        #[arg(long)]
+        since: Option<String>,
+        /// Window end (exclusive), RFC 3339 UTC with millisecond precision.
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, value_enum, default_value = "day")]
+        bucket: UsageBucket,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum UsageBucket {
+    Day,
+    Hour,
 }
 
 #[derive(Debug, Subcommand)]

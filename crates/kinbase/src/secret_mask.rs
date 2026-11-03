@@ -219,7 +219,7 @@ fn json_escaped(value: &str, ascii: bool) -> String {
 /// order owns a value several names share. A value's JSON-escaped spellings
 /// map to the same name, so text that already went through a serializer is
 /// masked too.
-pub fn build_table(pairs: &[(String, String)]) -> Vec<(String, String)> {
+pub fn build_table(pairs: &[(String, String)]) -> MaskTable {
     fn claim(owner: &mut Vec<(String, String)>, value: String, name: &str) {
         if !owner.iter().any(|(known, _)| *known == value) {
             owner.push((value, name.to_owned()));
@@ -244,13 +244,87 @@ pub fn build_table(pairs: &[(String, String)]) -> Vec<(String, String)> {
     }
     // A stable sort keeps file order among equal lengths.
     owner.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
-    owner
+    MaskTable::new(owner)
+}
+
+/// `(value, name)` replacements, longest value first, with a prefilter that
+/// tells at a glance that a text holds none of them. Most text (ids,
+/// digests, prose) holds no secret, and asking each value whether it occurs
+/// cost a searcher per value per string: 23% of a Stop that masks a large
+/// response.
+pub struct MaskTable {
+    pairs: Vec<(String, String)>,
+    /// How many leading bytes of every value the prefilter keys on (1 to 8).
+    width: usize,
+    /// Which first two bytes any value starts with, as bits.
+    leads: Box<[u64; 1024]>,
+    /// Every value's first `width` bytes, packed.
+    starts: std::collections::HashSet<u64>,
+}
+
+impl MaskTable {
+    fn new(pairs: Vec<(String, String)>) -> Self {
+        let width = pairs
+            .iter()
+            .map(|(value, _)| value.len())
+            .min()
+            .unwrap_or(0)
+            .min(8);
+        let mut leads = Box::new([0u64; 1024]);
+        let mut starts = std::collections::HashSet::new();
+        if width > 0 {
+            for (value, _) in &pairs {
+                let bytes = value.as_bytes();
+                if width >= 2 {
+                    let lead = usize::from(bytes[0]) << 8 | usize::from(bytes[1]);
+                    leads[lead / 64] |= 1 << (lead % 64);
+                }
+                starts.insert(pack(&bytes[..width]));
+            }
+        }
+        Self {
+            pairs,
+            width,
+            leads,
+            starts,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Whether some value may start somewhere in `text`. False means none
+    /// occurs; true means the replacement pass must look.
+    fn may_hold(&self, text: &[u8]) -> bool {
+        if self.width == 0 || text.len() < self.width {
+            return false;
+        }
+        (0..=text.len() - self.width).any(|at| {
+            if self.width >= 2 {
+                let lead = usize::from(text[at]) << 8 | usize::from(text[at + 1]);
+                if self.leads[lead / 64] & (1 << (lead % 64)) == 0 {
+                    return false;
+                }
+            }
+            self.starts.contains(&pack(&text[at..at + self.width]))
+        })
+    }
+}
+
+fn pack(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0u64, |packed, &byte| packed << 8 | u64::from(byte))
 }
 
 /// Every occurrence of each known value replaced with `$NAME`.
-pub fn mask_text(text: &str, table: &[(String, String)]) -> String {
+pub fn mask_text(text: &str, table: &MaskTable) -> String {
+    if !table.may_hold(text.as_bytes()) {
+        return text.to_owned();
+    }
     let mut text = text.to_owned();
-    for (value, name) in table {
+    for (value, name) in &table.pairs {
         if text.contains(value.as_str()) {
             text = text.replace(value.as_str(), &format!("${name}"));
         }
@@ -258,8 +332,8 @@ pub fn mask_text(text: &str, table: &[(String, String)]) -> String {
     text
 }
 
-/// `(value, name)` replacements, longest value first (`build_table`).
-pub type Table = Arc<Vec<(String, String)>>;
+/// The replacement table (`build_table`).
+pub type Table = Arc<MaskTable>;
 
 /// What one reference file contributed, keyed by its mtime and size.
 #[derive(Default)]
@@ -282,14 +356,14 @@ impl SecretMask {
         let files = config.files.iter().map(|_| FileState::default()).collect();
         Self {
             config,
-            state: Mutex::new((files, Arc::new(Vec::new()))),
+            state: Mutex::new((files, Arc::new(MaskTable::new(Vec::new())))),
         }
     }
 
     /// The replacement table, refreshed from any file that changed.
     pub fn table(&self) -> Table {
         let Ok(mut guard) = self.state.lock() else {
-            return Arc::new(Vec::new());
+            return Arc::new(MaskTable::new(Vec::new()));
         };
         let (files, table) = &mut *guard;
         let mut changed = false;
@@ -412,7 +486,7 @@ pub fn mask_value(value: &mut Value) -> bool {
 }
 
 /// `mask_value` with a table already in hand.
-pub fn mask_value_with(value: &mut Value, table: &[(String, String)]) -> bool {
+pub fn mask_value_with(value: &mut Value, table: &MaskTable) -> bool {
     match value {
         Value::String(text) => {
             let masked = mask_text(text, table);
@@ -440,6 +514,40 @@ pub fn mask_value_with(value: &mut Value, table: &[(String, String)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prefilter_never_changes_what_is_masked() {
+        let pairs = [
+            ("API_TOKEN", "tok-0123456789"),
+            ("LONG_SECRET", "tok-0123456789-and-more"),
+            ("QUOTED", "pa\"ss\\w\u{f6}rd-1"),
+            ("OTHER", "zz-secret-zz"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        let table = build_table(&pairs);
+        let naive = |text: &str| {
+            let mut text = text.to_owned();
+            for (value, name) in &table.pairs {
+                text = text.replace(value.as_str(), &format!("${name}"));
+            }
+            text
+        };
+        let texts = [
+            "",
+            "tok",
+            "tok-012345678",
+            "tok-0123456789",
+            "xtok-0123456789y",
+            "tok-0123456789-and-more and tok-0123456789",
+            "a zz-secret-zz b zz-secret-z",
+            "{\"t\":\"pa\\\"ss\\\\w\\u00f6rd-1\"}",
+            "plain prose with no secret at all, \u{e9}t\u{e9}",
+            "zz-secret-zztok-0123456789",
+        ];
+        for text in texts {
+            assert_eq!(mask_text(text, &table), naive(text), "{text:?}");
+        }
+    }
 
     fn owned(keys: &[&str]) -> Vec<String> {
         keys.iter().map(|key| key.to_string()).collect()

@@ -307,7 +307,11 @@ def test_native_host_events_prime_capture_and_exclude_personal(
             "envelope_fixture": {"host_version": frozen["version"],
                                  "provenance": frozen["provenance"]},
             "capture_continued": bool(captured),
-            "stop_checkpointed": len(checkpoints) > checkpoints_before_stop,
+            # A checkpoint that decided nothing is not recorded (it would
+            # carry only counters the ledgers already hold); one that did is.
+            "stop_checkpointed": dispatched["Stop"].get("checkpointed") is True
+            and (len(checkpoints) > checkpoints_before_stop
+                 or dispatched["Stop"].get("checkpoint_recorded") is False),
         },
         label="native host events prime capture and exclude Personal",
     )

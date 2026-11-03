@@ -425,7 +425,7 @@ pub fn decay_policy() -> Vec<Value> {
     ]
 }
 
-fn expiry_of(event: &FactEvent) -> Option<String> {
+pub(crate) fn expiry_of(event: &FactEvent) -> Option<String> {
     if let Some(until) = &event.effective_until {
         return Some(until.clone());
     }

@@ -170,36 +170,6 @@ struct Ledger {
     sources: BTreeMap<String, i128>,
 }
 
-/// An exclusive lock on the hand-off ledger, held from reading it to writing it
-/// back, so two hand-offs (or a hand-off and a purge) never overwrite each
-/// other's entries. Released when dropped.
-struct LedgerLock {
-    _file: std::fs::File,
-}
-
-fn lock_ledger(dir: &Path) -> Result<LedgerLock, ContractError> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join(LEDGER_LOCK))
-        .map_err(|error| ContractError::io("Kindex hand-off ledger lock", error))?;
-    loop {
-        // SAFETY: flock on a descriptor this function owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(LedgerLock { _file: file });
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(ContractError::io("Kindex hand-off ledger lock", error));
-        }
-    }
-}
-
 /// What one hand-off sends to Kindex and the ledger it leaves.
 #[derive(Debug, Default)]
 struct Plan {
@@ -970,7 +940,7 @@ pub fn hand_off(
     let root = kindex_root(data_root)?;
     let dir = handoff_dir(&root)?;
     let setup = setup(cfg, &dir)?;
-    let _lock = lock_ledger(&dir)?;
+    let _lock = crate::paths::lock_file(&dir.join(LEDGER_LOCK), "Kindex hand-off ledger lock")?;
     sweep(&dir, cfg);
     let ledger = load_ledger(&dir)?;
     let present: BTreeSet<PathBuf> = seen.listed.iter().map(|path| canonical(path)).collect();
@@ -1040,7 +1010,7 @@ fn purge_expired(
     setup: &Setup,
     now: i64,
 ) -> Result<usize, ContractError> {
-    let _lock = lock_ledger(dir)?;
+    let _lock = crate::paths::lock_file(&dir.join(LEDGER_LOCK), "Kindex hand-off ledger lock")?;
     sweep(dir, cfg);
     let mut ledger = load_ledger(dir)?;
     let (due, kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut ledger.conversations)

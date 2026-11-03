@@ -73,6 +73,13 @@ pub struct PersonalKindexConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompanyConfig {
     pub url: String,
+    pub oidc_issuer: Option<String>,
+    pub oidc_client_id: Option<String>,
+    pub oidc_client_secret_file: Option<PathBuf>,
+    /// A gateway API key for a caller that cannot sign in through a browser
+    /// (an agent sandbox). Sent as `Authorization: ApiKey <key>`; the gateway
+    /// checks and strips it, and the store still checks the facts token.
+    pub gateway_api_key_file: Option<PathBuf>,
     pub facts_token_file: PathBuf,
     pub root_public_key_file: PathBuf,
     pub cache_root: PathBuf,
@@ -84,6 +91,11 @@ pub struct CompanyConfig {
     /// Mirrors the service flag: set only where the endpoint is reached over a
     /// network whose isolation is enforced somewhere other than the interface.
     pub allow_non_loopback: bool,
+    /// How long a snapshot read waits for the service to answer. A snapshot
+    /// costs what the Company log costs, so a growing store outgrows any fixed
+    /// bound; a deployment raises this instead of shipping a new binary. Other
+    /// requests keep the default: hooks post through the same client.
+    pub snapshot_timeout_seconds: u64,
 }
 
 /// The processors a `[classifier]` may send session text to: `local` (the
@@ -199,6 +211,14 @@ pub struct SharedCompanyAccess {
     /// Carried through so a shared process applies the same endpoint rule the
     /// launcher was configured with, rather than re-deciding it.
     pub allow_non_loopback: bool,
+    /// Carried through for the same reason: the shared process reads the
+    /// snapshots, so it must wait as long as the launcher was configured to.
+    #[serde(default = "default_snapshot_timeout_seconds")]
+    pub snapshot_timeout_seconds: u64,
+}
+
+fn default_snapshot_timeout_seconds() -> u64 {
+    crate::company::client::DEFAULT_READ_TIMEOUT_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,15 +597,68 @@ pub fn parse_user_config(path: &Path, text: &str) -> Result<UserConfig, Contract
                     "client_key_file",
                     "maintainer_key_file",
                     "allow_non_loopback",
+                    "snapshot_timeout_seconds",
+                    "oidc_issuer",
+                    "oidc_client_id",
+                    "oidc_client_secret_file",
+                    "gateway_api_key_file",
                 ],
                 "[company]",
             )?;
             let url = required_str(section, "url", "company")?.to_owned();
             let allow_non_loopback = optional_bool(section, "allow_non_loopback", "company")?;
-            validate_loopback_url(&url, allow_non_loopback)?;
+            let optional_text = |key: &str| {
+                section
+                    .get(key)
+                    .map(|_| required_str(section, key, "company").map(str::to_owned))
+                    .transpose()
+            };
+            let oidc_issuer = optional_text("oidc_issuer")?;
+            let oidc_client_id = optional_text("oidc_client_id")?;
+            let oidc_client_secret_file =
+                optional_path(section, "oidc_client_secret_file", "company")?;
+            if oidc_issuer.is_some() != oidc_client_id.is_some()
+                || (oidc_issuer.is_none() && oidc_client_secret_file.is_some())
+            {
+                return Err(config_error(
+                    "company OIDC needs both oidc_issuer and oidc_client_id",
+                ));
+            }
+            let gateway_api_key_file = optional_path(section, "gateway_api_key_file", "company")?;
+            if oidc_issuer.is_some() && gateway_api_key_file.is_some() {
+                return Err(config_error(
+                    "company takes one gateway credential: OIDC or gateway_api_key_file",
+                ));
+            }
+            let gateway = oidc_issuer.is_some() || gateway_api_key_file.is_some();
+            validate_loopback_url(&url, allow_non_loopback, gateway)?;
+            if gateway_api_key_file.is_some() {
+                crate::oidc::validate_provider_url(&url)?;
+            }
+            if let Some(issuer) = &oidc_issuer {
+                crate::oidc::validate_provider_url(issuer)?;
+                crate::oidc::validate_provider_url(&url)?;
+            }
+            let snapshot_timeout_seconds = match section.get("snapshot_timeout_seconds") {
+                None => default_snapshot_timeout_seconds(),
+                Some(value) => value
+                    .as_integer()
+                    .filter(|seconds| (1..=600).contains(seconds))
+                    .and_then(|seconds| u64::try_from(seconds).ok())
+                    .ok_or_else(|| {
+                        config_error(
+                            "company.snapshot_timeout_seconds must be an integer within 1..=600",
+                        )
+                    })?,
+            };
             Some(CompanyConfig {
                 url,
+                oidc_issuer,
+                oidc_client_id,
+                oidc_client_secret_file,
+                gateway_api_key_file,
                 allow_non_loopback,
+                snapshot_timeout_seconds,
                 facts_token_file: absolute(
                     required_str(section, "facts_token_file", "company")?,
                     "company.facts_token_file",
@@ -892,10 +965,20 @@ fn default_host_instance() -> String {
     })
 }
 
-pub fn validate_loopback_url(url: &str, allow_non_loopback: bool) -> Result<(), ContractError> {
+pub fn validate_loopback_url(
+    url: &str,
+    allow_non_loopback: bool,
+    oidc: bool,
+) -> Result<(), ContractError> {
+    let scheme = if oidc {
+        "http:// or https://"
+    } else {
+        "http://"
+    };
     let rest = url
         .strip_prefix("http://")
-        .ok_or_else(|| config_error("company.url must be an http:// URL"))?;
+        .or_else(|| url.strip_prefix("https://").filter(|_| oidc))
+        .ok_or_else(|| config_error(format!("company.url must be an {scheme} URL")))?;
     let authority = rest.split('/').next().unwrap_or_default();
     let host = authority
         .rsplit_once(':')
@@ -915,10 +998,48 @@ pub fn validate_loopback_url(url: &str, allow_non_loopback: bool) -> Result<(), 
 }
 
 impl UserConfig {
+    pub fn oidc_configured(&self) -> bool {
+        self.company
+            .as_ref()
+            .is_some_and(|company| company.oidc_issuer.is_some())
+    }
+
+    /// Either gateway credential admits the https gateway URL.
+    pub fn gateway_configured(&self) -> bool {
+        self.oidc_configured()
+            || self
+                .company
+                .as_ref()
+                .is_some_and(|company| company.gateway_api_key_file.is_some())
+    }
+
+    pub fn oidc(&self) -> Result<Option<crate::oidc::Config>, ContractError> {
+        let Some(company) = &self.company else {
+            return Ok(None);
+        };
+        let (Some(issuer), Some(client_id)) = (&company.oidc_issuer, &company.oidc_client_id)
+        else {
+            return Ok(None);
+        };
+        let client_secret = company
+            .oidc_client_secret_file
+            .as_ref()
+            .map(|path| crate::crypto::read_private_text(path, "OIDC client secret"))
+            .transpose()?
+            .map(|secret| secret.trim().to_owned());
+        Ok(Some(crate::oidc::Config {
+            issuer: issuer.clone(),
+            client_id: client_id.clone(),
+            client_secret,
+            session_path: self.path.with_file_name("oidc.json"),
+        }))
+    }
+
     /// Derive the immutable shared-process configuration. Reads every token
     /// and key file under the cli.md file rules; contents are held in memory
     /// only. The Personal data root is deliberately not representable here.
     pub fn shared(&self) -> Result<SharedConfig, ContractError> {
+        let _ = self.oidc()?;
         let company = match &self.company {
             None => None,
             Some(company) => {
@@ -960,6 +1081,7 @@ impl UserConfig {
                 Some(SharedCompanyAccess {
                     url: company.url.clone(),
                     allow_non_loopback: company.allow_non_loopback,
+                    snapshot_timeout_seconds: company.snapshot_timeout_seconds,
                     facts_token,
                     admin_token,
                     directory_token,
@@ -1083,6 +1205,14 @@ pub struct ServiceConfig {
     pub requests_per_minute: i64,
     pub revocation_freshness_seconds: i64,
     pub directory_retention_seconds: i64,
+    /// Whether the service writes a usage row per authenticated request. Off
+    /// unless set: a row names the principal and a stable client
+    /// fingerprint, which spec/product.md P-3 keeps out of Company logs until
+    /// a ruling admits them.
+    pub record_usage: bool,
+    /// How long a usage row is kept. At least a day: the store refuses to
+    /// delete a younger row.
+    pub usage_retention_seconds: i64,
     /// Exact canonical authority scopes granted to the facts token issued
     /// from `facts_token_file`; empty grants nothing.
     pub facts_token_scopes: Vec<String>,
@@ -1121,6 +1251,8 @@ pub fn load_service_config(path: &Path) -> Result<ServiceConfig, ContractError> 
             "requests_per_minute",
             "revocation_freshness_seconds",
             "directory_retention_seconds",
+            "record_usage",
+            "usage_retention_seconds",
             "facts_token_scopes",
         ],
         "service config",
@@ -1179,6 +1311,8 @@ pub fn load_service_config(path: &Path) -> Result<ServiceConfig, ContractError> 
         requests_per_minute: integer("requests_per_minute", Some(600), 1)?,
         revocation_freshness_seconds: integer("revocation_freshness_seconds", Some(900), 1)?,
         directory_retention_seconds: integer("directory_retention_seconds", Some(365 * 24 * 3600), 1)?,
+        record_usage: optional_bool(&table, "record_usage", "service")?,
+        usage_retention_seconds: integer("usage_retention_seconds", Some(30 * 24 * 3600), 24 * 3600)?,
         facts_token_scopes: table
             .get("facts_token_scopes")
             .map(|value| {
@@ -1351,5 +1485,123 @@ mod secret_mask_config_tests {
         ] {
             assert!(parse(section).is_err(), "accepted: {section}");
         }
+    }
+}
+
+#[cfg(test)]
+mod company_snapshot_timeout_tests {
+    use super::*;
+
+    fn company(extra: &str) -> Result<UserConfig, ContractError> {
+        let text = format!(
+            "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\n\n\
+             [company]\nurl = \"http://127.0.0.1:8421\"\n\
+             facts_token_file = \"/private/example/kinbase/facts.token\"\n\
+             root_public_key_file = \"/private/example/kinbase/root-public.key\"\n\
+             cache_root = \"/private/example/kinbase/cache\"\n{extra}\n"
+        );
+        parse_user_config(Path::new("/private/example/config.toml"), &text)
+    }
+
+    fn timeout_of(extra: &str) -> u64 {
+        company(extra)
+            .expect("config parses")
+            .company
+            .expect("company section")
+            .snapshot_timeout_seconds
+    }
+
+    #[test]
+    fn the_snapshot_budget_defaults_and_a_deployment_can_raise_it() {
+        assert_eq!(
+            timeout_of(""),
+            crate::company::client::DEFAULT_READ_TIMEOUT_SECONDS
+        );
+        assert_eq!(timeout_of("snapshot_timeout_seconds = 90"), 90);
+        assert_eq!(timeout_of("snapshot_timeout_seconds = 600"), 600);
+    }
+
+    #[test]
+    fn a_snapshot_budget_outside_its_range_is_refused() {
+        for bad in [
+            "snapshot_timeout_seconds = 0",
+            "snapshot_timeout_seconds = -5",
+            "snapshot_timeout_seconds = 601",
+            "snapshot_timeout_seconds = \"90\"",
+            "snapshot_timeout_seconds = 1.5",
+        ] {
+            assert_eq!(
+                company(bad).expect_err(bad).code,
+                "CONFIG_INVARIANT",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_access_written_before_the_field_existed_keeps_the_default() {
+        let access = SharedCompanyAccess {
+            url: "http://127.0.0.1:8421".to_owned(),
+            facts_token: TokenRecord {
+                token: "facts".to_owned(),
+            },
+            admin_token: None,
+            directory_token: None,
+            authority_token: None,
+            root_public_key: String::new(),
+            cache_root: PathBuf::from("/private/example/kinbase/cache"),
+            client_private_seed: None,
+            maintainer_private_seed: None,
+            client_key_file: PathBuf::from("/private/example/kinbase/client.key"),
+            maintainer_key_file: PathBuf::from("/private/example/kinbase/maintainer.key"),
+            allow_non_loopback: false,
+            snapshot_timeout_seconds: 90,
+        };
+        let mut value = serde_json::to_value(&access).expect("serializes");
+        assert_eq!(value["snapshot_timeout_seconds"], 90);
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("snapshot_timeout_seconds");
+        let older: SharedCompanyAccess = serde_json::from_value(value).expect("deserializes");
+        assert_eq!(
+            older.snapshot_timeout_seconds,
+            crate::company::client::DEFAULT_READ_TIMEOUT_SECONDS
+        );
+    }
+}
+
+#[cfg(test)]
+mod gateway_api_key_tests {
+    use super::*;
+
+    fn company(extra: &str) -> Result<UserConfig, ContractError> {
+        let text = format!(
+            "schema_version = \"1\"\n\n[personal]\ndata_root = \"/private/example/kindex\"\n\n[company]\nfacts_token_file = \"/private/example/facts.token\"\nroot_public_key_file = \"/private/example/root.pub\"\ncache_root = \"/private/example/cache\"\n{extra}"
+        );
+        parse_user_config(Path::new("/private/example/config.toml"), &text)
+    }
+
+    #[test]
+    fn a_gateway_api_key_admits_the_https_gateway_and_nothing_looser() {
+        let key = "gateway_api_key_file = \"/private/example/gateway.key\"\n";
+        let gateway = "url = \"https://kinbase.example.com\"\nallow_non_loopback = true\n";
+        let config = company(&format!("{gateway}{key}")).unwrap().company.unwrap();
+        assert_eq!(
+            config.gateway_api_key_file.as_deref(),
+            Some(Path::new("/private/example/gateway.key"))
+        );
+        // Without a gateway credential, https stays refused, as on main.
+        assert!(company(gateway).is_err());
+        // One credential: an API key or OIDC, not both.
+        assert!(company(&format!(
+            "{gateway}{key}oidc_issuer = \"https://accounts.google.com\"\noidc_client_id = \"client\"\n"
+        ))
+        .is_err());
+        // A routable plaintext URL would send the key in the clear.
+        assert!(company(&format!(
+            "url = \"http://kinbase.example.com\"\nallow_non_loopback = true\n{key}"
+        ))
+        .is_err());
     }
 }

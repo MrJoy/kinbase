@@ -178,11 +178,15 @@ fn codex_plan_keeps_foreign_handlers_and_replaces_only_its_own() {
     let first = plan(&home, &bin, "codex", &repo);
     let table: toml::Value = planned_content(&first).parse().expect("planned toml");
     assert_eq!(table["model"].as_str(), Some("gpt"));
-    let stop: Vec<String> = table["hooks"]["Stop"]
+    // Foreign flat entries stay; this program's own is a nested group, the
+    // shape Codex runs.
+    let document = serde_json::to_value(&table).expect("toml as json");
+    let stop: Vec<String> = document["hooks"]["Stop"]
         .as_array()
         .expect("Stop array")
         .iter()
         .filter_map(|handler| handler["command"].as_str().map(str::to_owned))
+        .chain(commands(&document, "Stop"))
         .collect();
     assert!(
         stop.contains(&"/usr/local/bin/stop.sh".to_owned()),
@@ -204,6 +208,53 @@ fn codex_plan_keeps_foreign_handlers_and_replaces_only_its_own() {
     fs::write(&config, planned_content(&first)).expect("apply plan");
     let second = plan(&home, &bin, "codex", &repo);
     assert_eq!(planned_content(&second), planned_content(&first));
+}
+
+#[test]
+fn codex_plan_writes_hooks_json_when_the_user_keeps_one() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let bin = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fake_host(&bin, "codex", "0.50.0");
+    let codex = home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let foreign = json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": "policy-check --adapter codex", "timeout": 30000}
+    ]}]}});
+    fs::write(codex.join("hooks.json"), foreign.to_string()).expect("hooks.json");
+    // What an earlier build left: a flat entry Codex never ran, beside the
+    // user's own settings and trust records.
+    fs::write(
+        codex.join("config.toml"),
+        "model = \"gpt\"\n\n[hooks.state.\"x:pre_tool_use:0:0\"]\ntrusted_hash = \"abc\"\n\n[[hooks.Stop]]\ntype = \"command\"\ncommand = \"'/nix/store/old/bin/.kinbase-wrapped' hooks dispatch codex Stop\"\n",
+    )
+    .expect("config.toml");
+
+    let first = plan(&home, &bin, "codex", &repo);
+    assert_eq!(first["files"][0]["path"], ".codex/hooks.json");
+    assert_eq!(first["files"][1]["path"], ".codex/config.toml");
+    let toml: toml::Value = first["files"][1]["content"]
+        .as_str()
+        .expect("toml content")
+        .parse()
+        .expect("planned toml");
+    assert_eq!(toml["model"].as_str(), Some("gpt"));
+    assert!(toml["hooks"].get("Stop").is_none(), "stale flat entry kept: {toml}");
+    assert_eq!(
+        toml["hooks"]["state"]["x:pre_tool_use:0:0"]["trusted_hash"].as_str(),
+        Some("abc")
+    );
+    let document: Value = serde_json::from_str(&planned_content(&first)).expect("hooks.json");
+    assert_eq!(document["hooks"]["PreToolUse"][0], foreign["hooks"]["PreToolUse"][0]);
+    for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "PreCompact", "Stop", "SessionEnd"] {
+        assert_eq!(own(&commands(&document, event), "codex", event), 1, "{event}");
+    }
+    fs::write(codex.join("config.toml"), first["files"][1]["content"].as_str().unwrap())
+        .expect("apply toml");
+    let second = plan(&home, &bin, "codex", &repo);
+    assert_eq!(second["files"].as_array().map(Vec::len), Some(1), "nothing left to clear");
 }
 
 fn personal_store(root: &Path) -> PrivateStore {
@@ -428,10 +479,9 @@ fn dispatch_accepts_host_envelopes_with_control_characters_and_floats() {
     let receipt: Value = serde_json::from_slice(&output.stdout).expect("Stop receipt");
     assert_eq!(receipt["checkpointed"], true, "{receipt}");
     assert_eq!(receipt["session_id"], "host-session-1");
-    let ledger = fs::read_to_string(world.personal.join("session-checkpoints.jsonl"))
-        .expect("checkpoint ledger written");
-    assert_eq!(ledger.lines().count(), 1);
-    assert!(ledger.contains("\"session_id\":\"host-session-1\""));
+    // Nothing was decided, so nothing is recorded.
+    assert_eq!(receipt["checkpoint_recorded"], false, "{receipt}");
+    assert!(!world.personal.join("session-checkpoints.jsonl").exists());
 
     // PreToolUse: a multi-line shell command, then an MCP tool whose input
     // carries a float and multi-line prose, as the host sends each of them.
@@ -878,6 +928,31 @@ fn session_end_does_not_read_the_checkpoint_ledger() {
         ledger.write_at(b"\n", size - 1).expect("terminate ledger");
     }
     drop(ledger);
+    // A candidate for the checkpoint to decide, so it has a record to append
+    // to a ledger far too large for a hook to read or index.
+    let canonical = kinbase::json::canonical_text(&json!({
+        "destination": "personal",
+        "atom_kind": "constraint",
+        "scope": "host-session",
+        "statement": "Retries stop after five attempts."
+    }));
+    fs::write(
+        world.personal.join("candidates.jsonl"),
+        format!(
+            "{}\n",
+            kinbase::json::canonical_text(&json!({
+                "candidate_id": "cand_end",
+                "session_id": "host-session-end",
+                "admission_mode": "automatic",
+                "destination": "personal",
+                "principal": "principal-a",
+                "canonical": canonical,
+                "payload_digest": kinbase::hash::sha256_text(&canonical),
+                "confidence": 8000
+            }))
+        ),
+    )
+    .expect("candidates");
     let envelope = json!({
         "session_id": "host-session-end",
         "hook_event_name": "SessionEnd",

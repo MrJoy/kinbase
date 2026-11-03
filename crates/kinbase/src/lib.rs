@@ -19,6 +19,7 @@ pub mod company;
 pub mod config;
 pub mod corpus;
 pub mod crypto;
+pub mod dream;
 pub mod error;
 pub mod hash;
 pub mod hooks;
@@ -26,8 +27,10 @@ pub mod http;
 pub mod ingest;
 pub mod json;
 pub mod launcher;
+pub mod ledger_index;
 pub mod lifecycle;
 pub mod model;
+pub mod oidc;
 pub mod output;
 pub mod paths;
 #[cfg(feature = "personal-recall")]
@@ -44,6 +47,7 @@ pub mod secret_mask;
 pub mod session;
 pub mod store;
 pub mod time;
+pub mod usage;
 
 pub use crate::command_types::*;
 pub use clap::Parser;

@@ -6,8 +6,10 @@
 pub mod cache;
 pub mod client;
 pub mod db;
+pub mod reduction;
 pub mod server;
 pub mod trust;
+pub mod view_cache;
 
 use crate::config::{ServiceConfig, load_service_config};
 use crate::crypto::PrivateKey;
@@ -115,6 +117,70 @@ pub fn serve(config_path: &Path, json_output: bool) -> Result<(), ContractError>
     server::serve(config, root, json_output)
 }
 
+/// Steward report over the service's usage rows. It runs beside the store
+/// rather than over HTTP: who used the service is not a fact any client
+/// token is scoped to read.
+pub fn usage(
+    config_path: &Path,
+    since: Option<&str>,
+    until: Option<&str>,
+    bucket: crate::usage::Bucket,
+    json_output: bool,
+) -> Result<(), ContractError> {
+    let config = load_service_config(config_path)?;
+    let window = crate::usage::Window::parse(since, until)?;
+    // A report must not be the thing that creates the store it reports on.
+    //
+    // spec/cli.md's first-run table answers "requested store uninitialized"
+    // with exit 2, but the closed taxonomy has no exit-2 code for a Company
+    // store (REPO_UNCERTIFIED names the Codebase one), and `ContractError::new`
+    // turns a code paired with the wrong exit into RUN_INTEGRITY_FAILED. This
+    // stays CONFIG_INVARIANT (exit 4) until the taxonomy gains a code; the
+    // gap is raised as a spec defect rather than papered over here.
+    let uninitialized = |message: &str| {
+        ContractError::refused(
+            "CONFIG_INVARIANT",
+            message,
+            format!(
+                "Run `kinbase company init --config {}` first; no store was created.",
+                config_path.display()
+            ),
+        )
+    };
+    if !config.sqlite_path.exists() {
+        return Err(uninitialized(
+            "the Company store named by sqlite_path does not exist",
+        ));
+    }
+    // Read-only: the report runs beside a live service, against whatever
+    // file sqlite_path names, and writes to neither.
+    let db = db::CompanyDb::connect_read_only(&config.sqlite_path)?;
+    // A store is this Company's once `company init` or `serve` has stamped
+    // its company_id; any other SQLite file, meta table or not, is refused.
+    let company_id = if db.has_table("meta")? {
+        db.meta("company_id")?
+    } else {
+        None
+    };
+    if company_id.as_deref() != Some(config.company_id.as_str()) {
+        return Err(uninitialized(
+            "the file named by sqlite_path is not this Company's initialized store",
+        ));
+    }
+    let mut report = crate::usage::report(&db, &window, bucket)?;
+    report["status"] = json!("company-usage");
+    report["company_id"] = json!(config.company_id);
+    // Recording is off unless the service config sets it; an empty report
+    // from a service that was never recording says so.
+    report["recording"] = json!(config.record_usage);
+    if json_output {
+        crate::output::emit(&report, true);
+    } else {
+        print!("{}", crate::usage::render_human(&report));
+    }
+    Ok(())
+}
+
 /// Steward helper: sign a JSON document with the Company root key as one of
 /// the closed message types and print it.
 pub fn sign(
@@ -171,7 +237,7 @@ pub fn publish(
         result["error"] = response.body.get("error").cloned().unwrap_or(Value::Null);
     }
     if response.status >= 400 {
-        return Err(client::error_from_response(&response).with_output_document(result));
+        return Err(client::error_from_response(&response, false).with_output_document(result));
     }
     crate::output::emit(&result, json_output);
     Ok(())

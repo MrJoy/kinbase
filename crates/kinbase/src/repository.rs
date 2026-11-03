@@ -3294,7 +3294,14 @@ pub fn status(
         }
     }
     let mut event_records = Vec::new();
-    let saga_terminal_events = crate::session::saga_terminal_events();
+    // Only a Fact event is looked up here, so a repository with none (or no
+    // config, hence no events) leaves the Personal ledger unread, as the
+    // per-event lookup did.
+    let saga_terminal_events = if fact_by_event_id.is_empty() {
+        BTreeMap::new()
+    } else {
+        crate::session::saga_terminal_events()
+    };
     let mut exceptions = Vec::new();
     let mut exception_request_accepted = false;
     // Steward relaxations live in Company; the snapshot publishes them. They

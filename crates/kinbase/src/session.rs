@@ -3986,21 +3986,29 @@ pub fn pending_orphan_count(repo_root: &Path) -> usize {
         .count()
 }
 
-/// Saga-authoritative fields for a terminal `orphan_abandoned` event that the
-/// destination service emitted: the saga state and the unresponsive closing
-/// authority. The fact's state is the reducer's, never the saga ledger's.
-/// `None` for every other event.
-pub fn saga_terminal_event_fields(event_id: &str) -> Option<Value> {
-    personal_records("orphan-abandonments.jsonl")
-        .into_iter()
-        .find(|record| crate::json::get_str(record, "event_id") == Some(event_id))
-        .map(|record| {
+/// Saga-authoritative fields for each terminal `orphan_abandoned` event that
+/// the destination service emitted, by event id: the saga state and the
+/// unresponsive closing authority. The fact's state is the reducer's, never
+/// the saga ledger's. An event absent from the map has none. Read once per
+/// caller: `status` used to stream and parse the whole ledger again for every
+/// event it reported, which took over 30 seconds of CPU on a repository with
+/// a few thousand events and a few thousand abandonments.
+pub fn saga_terminal_events() -> BTreeMap<String, Value> {
+    let mut by_event = BTreeMap::new();
+    for record in personal_records("orphan-abandonments.jsonl") {
+        let Some(event_id) = crate::json::get_str(&record, "event_id") else {
+            continue;
+        };
+        // The first record for an event wins, as a forward search found it.
+        by_event.entry(event_id.to_owned()).or_insert_with(|| {
             json!({
                 "saga_state": "abandoned",
                 "unresponsive_closing_authority": record.get("unresponsive_closing_authority").cloned().unwrap_or(Value::Null),
                 "apology_id": record.get("apology_id").cloned().unwrap_or(Value::Null)
             })
-        })
+        });
+    }
+    by_event
 }
 
 /// The store a classifier label names here, or `None` when this host has

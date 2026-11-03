@@ -403,6 +403,9 @@ fn status_closes_only_its_own_overdue_apologies_at_the_repository_root() {
         "maintainer-of-apology_here"
     );
     assert_eq!(row["fact_state"], "withdrawn", "{row}");
+    // The saga ledger, not the event, says the saga was abandoned.
+    assert_eq!(row["saga_state"], "abandoned", "{row}");
+    assert_eq!(row["apology_id"], "apology_here", "{row}");
     assert!(
         report["facts"]
             .as_array()

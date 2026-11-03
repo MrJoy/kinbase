@@ -3294,6 +3294,7 @@ pub fn status(
         }
     }
     let mut event_records = Vec::new();
+    let saga_terminal_events = crate::session::saga_terminal_events();
     let mut exceptions = Vec::new();
     let mut exception_request_accepted = false;
     // Steward relaxations live in Company; the snapshot publishes them. They
@@ -3362,11 +3363,9 @@ pub fn status(
             // A terminal saga event emitted by the destination service carries
             // the saga's own state for the orphaned claim (withdrawn) and the
             // unresponsive closing authority; the fan-out saga owns that fact.
-            if let Some(Value::Object(saga)) =
-                crate::session::saga_terminal_event_fields(&event.event_id)
-            {
+            if let Some(Value::Object(saga)) = saga_terminal_events.get(event.event_id.as_str()) {
                 for (key, value) in saga {
-                    record[key] = value;
+                    record[key] = value.clone();
                 }
             }
             event_records.push(record);

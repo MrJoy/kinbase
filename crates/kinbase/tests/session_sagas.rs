@@ -712,3 +712,65 @@ fn abandon_fanout_settles_only_the_named_candidates_and_reports_the_rest() {
         "{stdout}"
     );
 }
+
+#[test]
+fn abandon_fanout_skips_a_fanout_with_no_bound_event() {
+    let world = certified();
+    let stuck = "company:company-test";
+    plant_candidates(
+        &world,
+        &[
+            ("cand_stuck", stuck),
+            ("cand_unreserved", stuck),
+            ("cand_unbound", stuck),
+        ],
+    );
+    plant_fanout(&world, "cand_stuck", stuck, false);
+    // No reservation: the journal was opened and nothing was sent.
+    plant_marker(
+        &world,
+        "cand_unreserved",
+        stuck,
+        "receipt",
+        "receipt",
+        json!({}),
+    );
+    // A reservation with no event bytes bound, which recovery never sends.
+    plant_marker(
+        &world,
+        "cand_unbound",
+        stuck,
+        "nonce_reservation",
+        "nonce_reservation",
+        json!({"receipt_id": "receipt_cand_unbound"}),
+    );
+    let journal = world.repo.join(".kin/local/journal/fanout");
+
+    let report = abandon_report(&abandon_fanout(&world, stuck, true));
+    assert_eq!(
+        report["fanouts"],
+        json!([{"candidate_id": "cand_stuck", "receipt_id": "receipt_cand_stuck", "prior_state": "pending"}])
+    );
+    let skipped: Vec<&str> = report["skipped"]
+        .as_array()
+        .expect("skipped")
+        .iter()
+        .filter_map(|row| row["candidate_id"].as_str())
+        .collect();
+    assert_eq!(skipped, ["cand_unbound", "cand_unreserved"], "{report}");
+    for candidate in ["cand_unreserved", "cand_unbound"] {
+        assert!(!journal.join(candidate).join("done.json").exists());
+    }
+    let settled = decisions(&world);
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0]["candidate_id"], "cand_stuck");
+
+    // Named, a skipped fan-out is reported as skipped, not unmatched.
+    let report = abandon_report(
+        &abandon_fanout_command(&world, stuck, false, &["cand_unreserved"])
+            .output_alone()
+            .expect("run kinbase session abandon-fanout"),
+    );
+    assert_eq!(report["unmatched"], json!([]));
+    assert_eq!(report["skipped"][0]["candidate_id"], "cand_unreserved");
+}

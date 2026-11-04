@@ -4016,6 +4016,7 @@ pub fn abandon_fanouts(
     // Read once, as recovery does, and only if some fan-out is unfinished.
     let mut records: Option<std::collections::HashMap<String, Value>> = None;
     let mut settled = Vec::new();
+    let mut skipped = Vec::new();
     for dir in entries {
         let candidate_id = dir
             .file_name()
@@ -4048,21 +4049,29 @@ pub fn abandon_fanouts(
         if crate::json::get_str(record, "destination") != Some(destination) {
             continue;
         }
-        let reservation = journal.read("nonce_reservation");
+        // Recovery retries only a fan-out whose event bytes are bound in its
+        // nonce reservation, and leaves any other alone: nothing was sent to
+        // Company, there is no receipt id or digest to settle it under, and
+        // the journal may be an admission still on its way to the
+        // reservation. Abandon skips the same journals.
+        let Some(reservation) = journal
+            .read("nonce_reservation")
+            .filter(|marker| crate::json::get_str(marker, "event_canonical").is_some())
+        else {
+            skipped.push(json!({
+                "candidate_id": candidate_id,
+                "reason": "no event bytes are bound; Company was never sent it"
+            }));
+            continue;
+        };
         let prior = journal.read("receipt");
         let receipt_id = prior
             .as_ref()
             .and_then(|marker| crate::json::get_str(marker, "receipt_id"))
-            .or_else(|| {
-                reservation
-                    .as_ref()
-                    .and_then(|marker| crate::json::get_str(marker, "receipt_id"))
-            })
+            .or_else(|| crate::json::get_str(&reservation, "receipt_id"))
             .unwrap_or_default()
             .to_owned();
-        let payload_digest = reservation
-            .as_ref()
-            .and_then(|marker| crate::json::get_str(marker, "payload_digest"))
+        let payload_digest = crate::json::get_str(&reservation, "payload_digest")
             .unwrap_or_default()
             .to_owned();
         let prior_state = prior
@@ -4118,6 +4127,7 @@ pub fn abandon_fanouts(
     for candidate in candidates {
         let settled_here = settled
             .iter()
+            .chain(&skipped)
             .any(|row| crate::json::get_str(row, "candidate_id") == Some(candidate.as_str()));
         if !settled_here && !unmatched.contains(&candidate) {
             unmatched.push(candidate);
@@ -4127,6 +4137,7 @@ pub fn abandon_fanouts(
         "status": if apply { "abandoned" } else { "dry-run" },
         "destination": destination,
         "fanouts": settled,
+        "skipped": skipped,
         "unmatched": unmatched
     });
     if json {
@@ -4139,6 +4150,13 @@ pub fn abandon_fanouts(
                 "  {} ({})",
                 crate::json::get_str(row, "candidate_id").unwrap_or_default(),
                 crate::json::get_str(row, "prior_state").unwrap_or_default()
+            );
+        }
+        for row in &skipped {
+            println!(
+                "skipped {}: {}",
+                crate::json::get_str(row, "candidate_id").unwrap_or_default(),
+                crate::json::get_str(row, "reason").unwrap_or_default()
             );
         }
         if !unmatched.is_empty() {

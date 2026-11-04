@@ -647,3 +647,68 @@ fn abandon_fanout_refuses_a_non_company_destination() {
     let report = abandon_report(&abandon_fanout(&world, "company", false));
     assert_eq!(report["fanouts"], json!([]));
 }
+
+#[test]
+fn abandon_fanout_settles_only_the_named_candidates_and_reports_the_rest() {
+    let world = certified();
+    let stuck = "company:company-test";
+    plant_candidates(
+        &world,
+        &[
+            ("cand_named", stuck),
+            ("cand_unnamed", stuck),
+            ("cand_finished", stuck),
+        ],
+    );
+    plant_fanout(&world, "cand_named", stuck, false);
+    plant_fanout(&world, "cand_unnamed", stuck, false);
+    plant_fanout(&world, "cand_finished", stuck, true);
+    let journal = world.repo.join(".kin/local/journal/fanout");
+
+    // A finished fan-out and an id with no journal match nothing unfinished.
+    let report = abandon_report(
+        &abandon_fanout_command(
+            &world,
+            stuck,
+            true,
+            &["cand_named", "cand_finished", "cand_typo"],
+        )
+        .output_alone()
+        .expect("run kinbase session abandon-fanout"),
+    );
+    assert_eq!(
+        report["fanouts"],
+        json!([{"candidate_id": "cand_named", "receipt_id": "receipt_cand_named", "prior_state": "pending"}])
+    );
+    assert_eq!(report["unmatched"], json!(["cand_finished", "cand_typo"]));
+    assert_eq!(
+        read_marker(journal.join("cand_named/receipt.json"))["state"],
+        "refused"
+    );
+    assert!(!journal.join("cand_unnamed/done.json").exists());
+    assert_eq!(
+        read_marker(journal.join("cand_unnamed/receipt.json"))["state"],
+        "pending"
+    );
+    let settled = decisions(&world);
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0]["candidate_id"], "cand_named");
+
+    // Text output names them too.
+    let text = Command::new(env!("CARGO_BIN_EXE_kinbase"))
+        .current_dir(&world.repo)
+        .args(["session", "abandon-fanout", "--repo"])
+        .arg(&world.repo)
+        .args(["--destination", stuck, "--candidate", "cand_typo"])
+        .env("HOME", &world.home)
+        .env("XDG_CONFIG_HOME", &world.config_home)
+        .env_remove("KINBASE_COMPANY_URL")
+        .output_alone()
+        .expect("run kinbase session abandon-fanout");
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains("no unfinished fan-out") && stdout.contains("cand_typo"),
+        "{stdout}"
+    );
+}

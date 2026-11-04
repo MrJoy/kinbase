@@ -3979,7 +3979,8 @@ const FANOUT_ABANDONED: &str = "FANOUT_ABANDONED";
 /// later steward admission does not reopen the fan-out.
 ///
 /// Without `apply` it only reports what it would settle. `candidates` narrows
-/// it to those ids; empty means every unfinished fan-out to `destination`.
+/// it to those ids, and the report lists any that matched no unfinished
+/// fan-out; empty means every unfinished fan-out to `destination`.
 pub fn abandon_fanouts(
     repo_root: &Path,
     destination: &str,
@@ -4111,10 +4112,22 @@ pub fn abandon_fanouts(
             "prior_state": prior_state
         }));
     }
+    // A named id with no unfinished fan-out here (a typo, a finished saga,
+    // another destination's) is reported, never silently dropped.
+    let mut unmatched: Vec<&String> = Vec::new();
+    for candidate in candidates {
+        let settled_here = settled
+            .iter()
+            .any(|row| crate::json::get_str(row, "candidate_id") == Some(candidate.as_str()));
+        if !settled_here && !unmatched.contains(&candidate) {
+            unmatched.push(candidate);
+        }
+    }
     let report = json!({
         "status": if apply { "abandoned" } else { "dry-run" },
         "destination": destination,
-        "fanouts": settled
+        "fanouts": settled,
+        "unmatched": unmatched
     });
     if json {
         println!("{}", serde_json::to_string(&report).unwrap_or_default());
@@ -4126,6 +4139,13 @@ pub fn abandon_fanouts(
                 "  {} ({})",
                 crate::json::get_str(row, "candidate_id").unwrap_or_default(),
                 crate::json::get_str(row, "prior_state").unwrap_or_default()
+            );
+        }
+        if !unmatched.is_empty() {
+            let names: Vec<&str> = unmatched.iter().map(|id| id.as_str()).collect();
+            println!(
+                "no unfinished fan-out to {destination} for: {}",
+                names.join(", ")
             );
         }
     }

@@ -1287,7 +1287,11 @@ fn is_company_statement(lower: &str) -> bool {
     let words: Vec<&str> = lower.split_whitespace().collect();
     words.windows(2).any(|pair| {
         let modifier = pair[0].trim_start_matches(|c: char| !c.is_alphanumeric());
-        let modifier = modifier.strip_suffix("'s").unwrap_or(modifier);
+        // Both the ASCII and the typographic (U+2019) apostrophe.
+        let modifier = modifier
+            .strip_suffix("'s")
+            .or_else(|| modifier.strip_suffix("\u{2019}s"))
+            .unwrap_or(modifier);
         let topic = pair[1].trim_end_matches(|c: char| !c.is_alphanumeric());
         ORGANIZATION_WORDS.contains(&modifier) && TOPIC_WORDS.contains(&topic)
     })
@@ -2131,6 +2135,15 @@ mod tests {
     #[test]
     fn organisation_wide_claims_company_ownership() {
         let text = "Organisation-wide, retention is owned by the architecture authority.";
+        assert!(
+            is_company_statement(&text.to_lowercase()),
+            "an ownership claim was not Company: {text}"
+        );
+    }
+
+    #[test]
+    fn a_typographic_possessive_modifies_a_topic_word() {
+        let text = "The company\u{2019}s standards require signed releases.";
         assert!(
             is_company_statement(&text.to_lowercase()),
             "an ownership claim was not Company: {text}"

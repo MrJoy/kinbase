@@ -4049,6 +4049,17 @@ pub fn abandon_fanouts(
         if crate::json::get_str(record, "destination") != Some(destination) {
             continue;
         }
+        // With `apply`, everything below is read under the admission lock a
+        // recovery commits under: a saga it committed or finished since the
+        // check above must not be overwritten to refused.
+        let _generation = if apply {
+            Some(repository.admission_lock(&repository_uuid)?)
+        } else {
+            None
+        };
+        if journal.is_done() {
+            continue;
+        }
         // Recovery retries only a fan-out whose event bytes are bound in its
         // nonce reservation, and leaves any other alone: nothing was sent to
         // Company, there is no receipt id or digest to settle it under, and
@@ -4065,6 +4076,18 @@ pub fn abandon_fanouts(
             continue;
         };
         let prior = journal.read("receipt");
+        // A terminal receipt is Company's answer; recovery replays it as-is.
+        let terminal = prior
+            .as_ref()
+            .and_then(|marker| crate::json::get_str(marker, "state"))
+            .filter(|state| matches!(*state, "committed" | "refused"));
+        if let (Some(state), true) = (terminal, journal.is_complete("receipt")) {
+            skipped.push(json!({
+                "candidate_id": candidate_id,
+                "reason": format!("its receipt is already {state}; recovery finishes it")
+            }));
+            continue;
+        }
         let receipt_id = prior
             .as_ref()
             .and_then(|marker| crate::json::get_str(marker, "receipt_id"))
@@ -4100,7 +4123,6 @@ pub fn abandon_fanouts(
                 "state": "pending",
                 "abandoned": true
             });
-            let _generation = repository.admission_lock(&repository_uuid)?;
             journal.begin("receipt", json!({}))?;
             let marker = journal.complete(
                 "receipt",

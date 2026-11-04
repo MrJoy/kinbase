@@ -774,3 +774,76 @@ fn abandon_fanout_skips_a_fanout_with_no_bound_event() {
     assert_eq!(report["unmatched"], json!([]));
     assert_eq!(report["skipped"][0]["candidate_id"], "cand_unreserved");
 }
+
+/// The receipt marker a Company commit leaves before the saga's `done`.
+fn plant_committed_receipt(world: &Certified, candidate: &str, destination: &str) {
+    plant_marker(
+        world,
+        candidate,
+        destination,
+        "receipt",
+        "receipt_written",
+        json!({"state": "committed", "receipt_id": format!("receipt_{candidate}"), "apology_ids": []}),
+    );
+}
+
+#[test]
+fn abandon_fanout_keeps_a_receipt_company_already_settled() {
+    let world = certified();
+    let stuck = "company:company-test";
+    plant_candidates(&world, &[("cand_committed", stuck)]);
+    // Company committed it; the process stopped before writing `done`.
+    plant_reservation(&world, "cand_committed", stuck);
+    plant_committed_receipt(&world, "cand_committed", stuck);
+    let journal = world.repo.join(".kin/local/journal/fanout");
+
+    let report = abandon_report(&abandon_fanout(&world, stuck, true));
+    assert_eq!(report["fanouts"], json!([]), "{report}");
+    assert_eq!(report["skipped"][0]["candidate_id"], "cand_committed");
+    assert_eq!(
+        read_marker(journal.join("cand_committed/receipt.json"))["state"],
+        "committed"
+    );
+    assert!(decisions(&world).is_empty());
+}
+
+#[test]
+fn abandon_fanout_rechecks_the_journal_under_the_admission_lock() {
+    use std::os::fd::AsRawFd as _;
+    let world = certified();
+    let stuck = "company:company-test";
+    plant_candidates(&world, &[("cand_racing", stuck)]);
+    plant_fanout(&world, "cand_racing", stuck, false);
+    let journal = world.repo.join(".kin/local/journal/fanout");
+
+    // Hold the admission lock, as a recovery committing this saga does.
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(world.repo.join(format!(".git/kinbase-{REPOSITORY}.lock")))
+        .expect("open admission lock");
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let child = abandon_fanout_command(&world, stuck, true, &[])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_alone()
+        .expect("spawn kinbase session abandon-fanout");
+    // Let it read the pending journal and queue on the lock.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    // The recovery commits and finishes, then releases the lock.
+    plant_committed_receipt(&world, "cand_racing", stuck);
+    plant_marker(&world, "cand_racing", stuck, "done", "done", json!({}));
+    drop(lock);
+    let output = child.wait_with_output().expect("wait for abandon-fanout");
+
+    let report = abandon_report(&output);
+    assert_eq!(report["fanouts"], json!([]), "{report}");
+    assert_eq!(
+        read_marker(journal.join("cand_racing/receipt.json"))["state"],
+        "committed"
+    );
+    assert!(decisions(&world).is_empty());
+}

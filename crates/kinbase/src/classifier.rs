@@ -1251,11 +1251,13 @@ fn is_company_statement(lower: &str) -> bool {
         "named authority",
     ];
     // Whole words, never substrings: "incorporate" is not "corporate".
-    const ORGANIZATION_WORDS: [&str; 5] = [
+    const ORGANIZATION_WORDS: [&str; 7] = [
         "company",
         "corporate",
         "organization",
         "organisation",
+        "organizational",
+        "organisational",
         "org",
     ];
     const TOPIC_WORDS: [&str; 9] = [
@@ -2108,6 +2110,19 @@ mod tests {
             assert!(
                 is_company_statement(&text.to_lowercase()),
                 "an ownership phrase was not Company: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_organizational_adjective_modifies_a_topic_word() {
+        for text in [
+            "The organizational policy requires signed releases.",
+            "Organisational standards require two reviewers.",
+        ] {
+            assert!(
+                is_company_statement(&text.to_lowercase()),
+                "an ownership claim was not Company: {text}"
             );
         }
     }

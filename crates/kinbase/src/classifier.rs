@@ -1286,13 +1286,21 @@ fn is_company_statement(lower: &str) -> bool {
     // `roadmap`" the two words are list items, not a modifier and its noun.
     let words: Vec<&str> = lower.split_whitespace().collect();
     words.windows(2).any(|pair| {
-        let modifier = pair[0].trim_start_matches(|c: char| !c.is_alphanumeric());
+        // Markdown emphasis wraps a word without separating it, so
+        // "**company** policy" is still a modifier and its noun. Separators
+        // such as ',' and ':' are not trimmed: they still split a list.
+        let is_emphasis = |c: char| c == '*' || c == '_';
+        let modifier = pair[0]
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .trim_end_matches(is_emphasis);
         // Both the ASCII and the typographic (U+2019) apostrophe.
         let modifier = modifier
             .strip_suffix("'s")
             .or_else(|| modifier.strip_suffix("\u{2019}s"))
             .unwrap_or(modifier);
-        let topic = pair[1].trim_end_matches(|c: char| !c.is_alphanumeric());
+        let topic = pair[1]
+            .trim_start_matches(is_emphasis)
+            .trim_end_matches(|c: char| !c.is_alphanumeric());
         ORGANIZATION_WORDS.contains(&modifier) && TOPIC_WORDS.contains(&topic)
     })
 }
@@ -2148,5 +2156,29 @@ mod tests {
             is_company_statement(&text.to_lowercase()),
             "an ownership claim was not Company: {text}"
         );
+    }
+
+    #[test]
+    fn markdown_emphasis_does_not_hide_a_modifier() {
+        for text in [
+            "The **company** policy requires signed releases.",
+            "The _company's_ standards require signed releases.",
+            "The company **policy** requires signed releases.",
+        ] {
+            assert!(
+                is_company_statement(&text.to_lowercase()),
+                "an emphasised claim was not Company: {text}"
+            );
+        }
+        // A separator still splits a list into items.
+        for text in [
+            "Tokens such as **organization**, **roadmap** and others.",
+            "Fields: company: policy.",
+        ] {
+            assert!(
+                !is_company_statement(&text.to_lowercase()),
+                "a list claimed Company ownership: {text}"
+            );
+        }
     }
 }

@@ -614,6 +614,9 @@ fn abandon_fanout_settles_only_the_named_company_destination() {
     assert_eq!(settled[0]["digest"], "digest_cand_stuck");
     assert_eq!(settled[0]["state"], "refused");
     assert_eq!(settled[0]["error_code"], "FANOUT_ABANDONED");
+    // Nothing was recovered: the ledger says it was abandoned.
+    assert_eq!(settled[0]["abandoned"], true);
+    assert!(settled[0].get("recovered").is_none(), "{:?}", settled[0]);
 
     // A second run finds nothing left to settle.
     let again = abandon_fanout(&world, stuck, true);

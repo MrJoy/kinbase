@@ -4088,7 +4088,7 @@ pub fn abandon_fanouts(
                 "decided_at": now_rfc3339_millis(),
                 "receipt_id": receipt_id,
                 "state": "pending",
-                "recovered": true
+                "abandoned": true
             });
             let _generation = repository.admission_lock(&repository_uuid)?;
             journal.begin("receipt", json!({}))?;

@@ -166,6 +166,8 @@ kinbase session start --host codex|claude --repo PATH
 kinbase session observe SESSION --event FILE
 kinbase session checkpoint SESSION
 kinbase session end SESSION
+kinbase session abandon-fanout --destination DESTINATION [--candidate CANDIDATE]... \
+  [--apply] [--repo PATH]
 kinbase proposals list --session SESSION
 kinbase proposals show CANDIDATE --destination DESTINATION
 kinbase proposals decide CANDIDATE --destination DESTINATION \
@@ -213,6 +215,17 @@ candidate's frozen question template. Decision/reset commands accept no free-tex
 edits, annotations, answers, or replacement bytes, and their control codes never
 enter a fact or experiment context. Suppressed suggestions remain private until expiry
 and their count is shown. No accept-all command exists.
+
+`abandon-fanout` settles this repository's unfinished fan-outs to one Company
+destination (`company` or `company:<id>`) as refused with `FANOUT_ABANDONED`, so
+recovery stops retrying an event Company will never commit. It is the admitting
+principal's decision: the event queued at Company stays queued, and a later steward
+admission does not reopen the fan-out. Without `--apply` it only reports. With it,
+each journal is read and written under the admission lock; a saga already finished,
+or whose receipt already holds Company's answer, is left as it is, and a Company
+answer that arrives after the refusal does not replace it. A fan-out with no bound
+event bytes was never sent and is skipped and listed. `--candidate` narrows the run
+to those ids, and the report lists any that matched no unfinished fan-out.
 
 ## Questions and authorities
 

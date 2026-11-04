@@ -6,6 +6,15 @@ Notable changes to Kinbase. Dates are UTC.
 
 ### Added
 
+- `kinbase session abandon-fanout --destination company:<id>`: settles this
+  repository's fan-outs to a Company destination that will never commit them (an
+  event parked in the steward queue) as refused, so recovery stops posting them on
+  every admission. A dry run by default; `--apply` writes the refused receipt and
+  finishes the saga, and `--candidate` narrows it to named ids. A fan-out with no
+  bound event, or with Company's answer already recorded, is skipped and listed, and
+  ids that match nothing are listed as `unmatched`. A Company answer that arrives
+  after the refusal no longer reopens the fan-out as pending.
+
 - Known-secret masking. A `[secret_mask]` table in the user config names env files
   (`files`), optional name selectors (`keys`) and a shortest value (`min_length`,
   default 8). Every selected value becomes `$NAME` before Kinbase digests, stores or

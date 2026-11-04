@@ -2056,7 +2056,7 @@ mod tests {
     #[test]
     fn a_topic_word_alone_does_not_claim_company_ownership() {
         // Session fragments the bare-substring match sent to a Company
-        // steward queue (#41).
+        // steward queue (#43).
         let mentions = [
             "The governance guard blocks the rules-file edit.",
             "[standard · T1, T3, T41; /validate Phase B/C] Per-requirement oracle and falsifier",

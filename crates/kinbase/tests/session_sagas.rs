@@ -847,3 +847,135 @@ fn abandon_fanout_rechecks_the_journal_under_the_admission_lock() {
     );
     assert!(decisions(&world).is_empty());
 }
+
+/// `session checkpoint` of `session` as the host's Stop runs it.
+fn checkpoint_command(world: &Certified, session: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kinbase"));
+    command
+        .current_dir(&world.repo)
+        .args(["session", "checkpoint", "--json", session])
+        .env("HOME", &world.home)
+        .env("XDG_CONFIG_HOME", &world.config_home)
+        .env_remove("KINBASE_COMPANY_URL");
+    command
+}
+
+/// A Company `/facts` endpoint that reports each POST on `posted` and
+/// answers it pending steward review only once `release` says so. Any other
+/// route is a 404.
+fn held_company(
+    posted: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake Company");
+    let port = listener.local_addr().expect("fake Company address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let Ok(request) = kinbase::http::read_request(&stream, 1 << 20) else {
+                continue;
+            };
+            if request.method == "POST" && request.route == "/facts" {
+                let _ = posted.send(());
+                let _ = release.recv();
+                let _ = kinbase::http::respond(
+                    &mut stream,
+                    202,
+                    &json!({"status": "pending-steward-review"}),
+                );
+            } else {
+                let _ = kinbase::http::respond(&mut stream, 404, &json!({}));
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn a_company_answer_that_lands_after_abandon_leaves_the_fanout_refused() {
+    let world = certified();
+    let destination = "company:root";
+    let canonical = kinbase::json::canonical_text(
+        &json!({"scope": "company", "statement": "Releases are signed."}),
+    );
+    private_write(
+        &world.personal.join("candidates.jsonl"),
+        &jsonl(&[json!({
+            "candidate_id": "cand_live",
+            "session_id": "sess_live",
+            "admission_mode": "automatic",
+            "destination": destination,
+            "canonical": canonical,
+            "payload_digest": kinbase::hash::sha256_text(&canonical)
+        })]),
+    );
+    // Company is unreachable, so the fan-out is left pending: stuck.
+    let first = checkpoint_command(&world, "sess_live")
+        .output_alone()
+        .expect("run kinbase session checkpoint");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let journal = world.repo.join(".kin/local/journal/fanout/cand_live");
+    assert_eq!(
+        read_marker(journal.join("receipt.json"))["state"],
+        "pending"
+    );
+
+    // The next checkpoint reaches a Company that holds its answer.
+    let (posted_tx, posted) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let port = held_company(posted_tx, release_rx);
+    let config = world.config_home.join("kinbase/config.toml");
+    let text = fs::read_to_string(&config).expect("read config");
+    private_write(
+        &config,
+        text.replace(
+            "http://127.0.0.1:1\"",
+            &format!("http://127.0.0.1:{port}\""),
+        )
+        .as_bytes(),
+    );
+    let retry = checkpoint_command(&world, "sess_live")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_alone()
+        .expect("spawn kinbase session checkpoint");
+    posted
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the retry posts the event to Company");
+
+    // Mid-POST, the principal abandons the fan-out.
+    let report = abandon_report(&abandon_fanout(&world, destination, true));
+    assert_eq!(
+        report["fanouts"][0]["candidate_id"], "cand_live",
+        "{report}"
+    );
+
+    // Company's answer lands after the saga was settled.
+    release.send(()).expect("release the Company answer");
+    let retried = retry.wait_with_output().expect("wait for checkpoint");
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let receipt = read_marker(journal.join("receipt.json"));
+    assert_eq!(receipt["state"], "refused", "{receipt}");
+    assert_eq!(receipt["attempt"]["error_code"], "FANOUT_ABANDONED");
+    assert_eq!(
+        read_marker(journal.join("done.json"))["journal_state"],
+        "done"
+    );
+    let last = decisions(&world)
+        .into_iter()
+        .rev()
+        .find(|row| row["candidate_id"] == "cand_live")
+        .expect("a decision for cand_live");
+    assert_eq!(last["state"], "refused", "{last}");
+}

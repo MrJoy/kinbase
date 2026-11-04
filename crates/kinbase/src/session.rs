@@ -3197,18 +3197,8 @@ fn commit_company(
         receipt_id,
     )?;
     // A terminal receipt is replayed as-is; a pending one is re-attempted.
-    if journal.is_complete("receipt") {
-        if let Some(marker) = journal.read("receipt") {
-            if matches!(
-                crate::json::get_str(&marker, "state"),
-                Some("committed") | Some("refused")
-            ) {
-                let summary = receipt_from_marker(&marker, receipt_id);
-                finalize_principal_receipt(base_receipt, &summary)?;
-                journal.finish()?;
-                return Ok(summary);
-            }
-        }
+    if let Some(summary) = replay_terminal_receipt(journal, receipt_id, base_receipt)? {
+        return Ok(summary);
     }
     // The Company destination runs its own transaction; the client sends
     // the event once per attempt and records the outcome it was given.
@@ -3295,6 +3285,13 @@ fn commit_company(
         }
     }
     let _generation = repository.admission_lock(repository_uuid)?;
+    // Company was asked without the lock, so the saga may have been settled
+    // meanwhile: `session abandon-fanout` refused it, or another admission
+    // wrote Company's answer. That receipt stands; writing this attempt's
+    // over it reopened an abandoned fan-out as pending.
+    if let Some(summary) = replay_terminal_receipt(journal, receipt_id, base_receipt)? {
+        return Ok(summary);
+    }
     journal.begin("receipt", json!({}))?;
     let marker = journal.complete(
         "receipt",
@@ -3311,6 +3308,31 @@ fn commit_company(
         journal.finish()?;
     }
     Ok(summary)
+}
+
+/// Finish a Company saga whose receipt marker is already terminal (committed
+/// or refused) with that receipt, and return it; `None` when it is not.
+fn replay_terminal_receipt(
+    journal: &FanoutJournal,
+    receipt_id: &str,
+    base_receipt: &Value,
+) -> Result<Option<Value>, ContractError> {
+    if !journal.is_complete("receipt") {
+        return Ok(None);
+    }
+    let Some(marker) = journal.read("receipt") else {
+        return Ok(None);
+    };
+    if !matches!(
+        crate::json::get_str(&marker, "state"),
+        Some("committed") | Some("refused")
+    ) {
+        return Ok(None);
+    }
+    let summary = receipt_from_marker(&marker, receipt_id);
+    finalize_principal_receipt(base_receipt, &summary)?;
+    journal.finish()?;
+    Ok(Some(summary))
 }
 
 /// The event with the admitting principal's approval of its exact bytes.

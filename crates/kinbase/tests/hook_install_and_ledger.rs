@@ -178,11 +178,15 @@ fn codex_plan_keeps_foreign_handlers_and_replaces_only_its_own() {
     let first = plan(&home, &bin, "codex", &repo);
     let table: toml::Value = planned_content(&first).parse().expect("planned toml");
     assert_eq!(table["model"].as_str(), Some("gpt"));
-    let stop: Vec<String> = table["hooks"]["Stop"]
+    // Foreign flat entries stay; this program's own is a nested group, the
+    // shape Codex runs.
+    let document = serde_json::to_value(&table).expect("toml as json");
+    let stop: Vec<String> = document["hooks"]["Stop"]
         .as_array()
         .expect("Stop array")
         .iter()
         .filter_map(|handler| handler["command"].as_str().map(str::to_owned))
+        .chain(commands(&document, "Stop"))
         .collect();
     assert!(
         stop.contains(&"/usr/local/bin/stop.sh".to_owned()),
@@ -204,6 +208,53 @@ fn codex_plan_keeps_foreign_handlers_and_replaces_only_its_own() {
     fs::write(&config, planned_content(&first)).expect("apply plan");
     let second = plan(&home, &bin, "codex", &repo);
     assert_eq!(planned_content(&second), planned_content(&first));
+}
+
+#[test]
+fn codex_plan_writes_hooks_json_when_the_user_keeps_one() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let bin = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fake_host(&bin, "codex", "0.50.0");
+    let codex = home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let foreign = json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": "policy-check --adapter codex", "timeout": 30000}
+    ]}]}});
+    fs::write(codex.join("hooks.json"), foreign.to_string()).expect("hooks.json");
+    // What an earlier build left: a flat entry Codex never ran, beside the
+    // user's own settings and trust records.
+    fs::write(
+        codex.join("config.toml"),
+        "model = \"gpt\"\n\n[hooks.state.\"x:pre_tool_use:0:0\"]\ntrusted_hash = \"abc\"\n\n[[hooks.Stop]]\ntype = \"command\"\ncommand = \"'/nix/store/old/bin/.kinbase-wrapped' hooks dispatch codex Stop\"\n",
+    )
+    .expect("config.toml");
+
+    let first = plan(&home, &bin, "codex", &repo);
+    assert_eq!(first["files"][0]["path"], ".codex/hooks.json");
+    assert_eq!(first["files"][1]["path"], ".codex/config.toml");
+    let toml: toml::Value = first["files"][1]["content"]
+        .as_str()
+        .expect("toml content")
+        .parse()
+        .expect("planned toml");
+    assert_eq!(toml["model"].as_str(), Some("gpt"));
+    assert!(toml["hooks"].get("Stop").is_none(), "stale flat entry kept: {toml}");
+    assert_eq!(
+        toml["hooks"]["state"]["x:pre_tool_use:0:0"]["trusted_hash"].as_str(),
+        Some("abc")
+    );
+    let document: Value = serde_json::from_str(&planned_content(&first)).expect("hooks.json");
+    assert_eq!(document["hooks"]["PreToolUse"][0], foreign["hooks"]["PreToolUse"][0]);
+    for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "PreCompact", "Stop", "SessionEnd"] {
+        assert_eq!(own(&commands(&document, event), "codex", event), 1, "{event}");
+    }
+    fs::write(codex.join("config.toml"), first["files"][1]["content"].as_str().unwrap())
+        .expect("apply toml");
+    let second = plan(&home, &bin, "codex", &repo);
+    assert_eq!(second["files"].as_array().map(Vec::len), Some(1), "nothing left to clear");
 }
 
 fn personal_store(root: &Path) -> PrivateStore {

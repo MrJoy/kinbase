@@ -15,6 +15,67 @@ Notable changes to Kinbase. Dates are UTC.
   ids that match nothing are listed as `unmatched`. A Company answer that arrives
   after the refusal no longer reopens the fan-out as pending.
 
+## 0.1.2 - 2026-10-30
+
+### Fixed
+
+- `hooks install codex` writes nested hook groups (`{"hooks": [...]}`), the
+  shape Codex runs, into `~/.codex/hooks.json` when the user keeps one. Earlier
+  builds wrote flat entries Codex never ran; a reinstall replaces them (and
+  takes them out of `config.toml` when the hooks move to `hooks.json`), and
+  `doctor` no longer counts them.
+- A Nix-store build no longer hooks its own store path, which the next update
+  removes: it hooks the first executable `kinbase` on PATH outside the store,
+  or refuses and says so.
+
+## 0.1.1 - 2026-10-26
+
+### Added
+
+- `[company] gateway_api_key_file` for callers that cannot sign in through a
+  browser (an agent sandbox): Company requests send `Authorization: ApiKey <key>`
+  beside `X-Kinbase-Token`, and the https gateway URL is admitted as with OIDC.
+  It cannot be combined with OIDC, and a routable `http://` URL is refused.
+
+### Changed
+
+- A `v*` release attaches its binaries to a draft and then publishes it, since
+  published releases are immutable; a re-run finishes the draft.
+
+## 0.1.0 - 2026-10-24
+
+### Added
+
+- Unchanged snapshot receipts. A full `/snapshot` now carries a signed `content_digest`;
+  a client offers it back as `known`, and when its content is still Company's answer
+  for that client's scopes and repository the service replies with a ~600-byte
+  root-signed `kinbase-snapshot-unchanged/1` receipt (fresh nonce, cursors and
+  validity clocks) instead of the snapshot. The cache keeps the content it verified,
+  takes freshness from the receipt in one transaction, and falls back to one full
+  refresh if another refresh replaced the content meanwhile. On a 22k-event store an
+  unchanged refresh costs ~23 ms and 627 B instead of 443 ms and 12.1 MB, and one read
+  against the hourly budget instead of the whole snapshot. `kinbase doctor` reports
+  `cache_freshness_record`: which signed document the cache's clocks came from,
+  re-verified.
+- `kinbase auth login` signs in through a browser with any OIDC provider: it
+  prints the sign-in URL, listens for the callback on loopback, and stores the
+  session in a mode-0600 `oidc.json` beside `config.toml`. The three optional
+  `[company]` keys are `oidc_issuer`, `oidc_client_id`, and
+  `oidc_client_secret_file`; the issuer and client ID must be set together, and
+  a partial configuration is refused. With OIDC configured, Company requests
+  use an `https://` gateway, carry the ID token in `Authorization` and the facts
+  token in `X-Kinbase-Token`, and automatically refresh the ID token before it
+  expires; a plaintext routable URL is refused. Without OIDC, existing behavior
+  is unchanged.
+
+- `[company] snapshot_timeout_seconds` in the user config: how long a snapshot
+  read waits for the Company service (integer 1..=600, default 20, the previous
+  fixed bound). A snapshot costs what the whole Company log costs, and in
+  one deployment at ~12k facts it outgrew 20 s, so every refresh reported
+  `COMPANY_UNREACHABLE`; a deployment can now raise the ceiling without a new
+  build. Only snapshot reads use it: checkpoint and Unknown posts from host hooks
+  keep the 20 s default.
+
 - Known-secret masking. A `[secret_mask]` table in the user config names env files
   (`files`), optional name selectors (`keys`) and a shortest value (`min_length`,
   default 8). Every selected value becomes `$NAME` before Kinbase digests, stores or
@@ -36,6 +97,16 @@ Notable changes to Kinbase. Dates are UTC.
   175 MB, every identity and receipt kept.
 
 ### Changed
+
+- The Company service reduces its log once per change instead of on every
+  `/snapshot`, `/facts` page and `/facts/<id>`, keeping two reductions (the one at
+  its own clock is never evicted) and rebuilding one at a time. A snapshot window
+  loads only the events it sends. Responses are byte-identical; on a 22k-event store
+  a cached `/snapshot` takes 0.44 s instead of 2.81 s and a `/facts` page 0.14 s
+  instead of 1.31 s.
+- At most two snapshots are assembled at once; a request beyond that gets a 503
+  `LIMIT_EXCEEDED` naming the ceiling, and the client keeps its cached snapshot.
+  Eight concurrent warm snapshots on that store went from +2 GB to +134 MB.
 
 - A checkpoint that decided nothing (no admission, hold, failure, Personal fact
   or swept state) is no longer recorded; its counters are already in the ledgers.

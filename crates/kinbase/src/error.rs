@@ -114,6 +114,8 @@ pub struct ContractError {
     /// keeping stdout to exactly one JSON line on failure.
     #[serde(skip)]
     pub output_document: Option<serde_json::Value>,
+    #[serde(skip)]
+    oidc_token_failure: bool,
 }
 
 impl ContractError {
@@ -153,7 +155,17 @@ impl ContractError {
             exit_override: None,
             detail: None,
             output_document: None,
+            oidc_token_failure: false,
         }
+    }
+
+    pub(crate) fn with_oidc_token_failure(mut self) -> Self {
+        self.oidc_token_failure = true;
+        self
+    }
+
+    pub(crate) fn is_oidc_token_failure(&self) -> bool {
+        self.oidc_token_failure
     }
 
     /// Attach the complete command document for the top-level boundary.

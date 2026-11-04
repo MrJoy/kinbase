@@ -952,7 +952,7 @@ fn ollama_request(
     Ok(body)
 }
 
-fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, ContractError> {
+pub(crate) fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, ContractError> {
     let mut output = Vec::new();
     loop {
         let end = bytes

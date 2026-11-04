@@ -4,8 +4,31 @@
 
 use crate::error::ContractError;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+
+pub(crate) fn lock_file(path: &Path, role: &str) -> Result<fs::File, ContractError> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| ContractError::io(role, error))?;
+    loop {
+        // SAFETY: the descriptor is owned and remains open while the lock is held.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        match std::io::Error::last_os_error() {
+            error if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            error => return Err(ContractError::io(role, error)),
+        }
+    }
+}
 
 /// `<hex-0:2>/<hex-2:4>/<remaining-60-hex>.json` from a verified digest.
 pub fn sharded_relative(digest: &str) -> Result<PathBuf, ContractError> {

@@ -426,7 +426,12 @@ fn status_closes_only_its_own_overdue_apologies_at_the_repository_root() {
     assert_eq!(terminal, 1);
 }
 
-fn abandon_fanout(world: &Certified, destination: &str, apply: bool) -> Output {
+fn abandon_fanout_command(
+    world: &Certified,
+    destination: &str,
+    apply: bool,
+    candidates: &[&str],
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kinbase"));
     command
         .current_dir(&world.repo)
@@ -436,47 +441,101 @@ fn abandon_fanout(world: &Certified, destination: &str, apply: bool) -> Output {
         .env("HOME", &world.home)
         .env("XDG_CONFIG_HOME", &world.config_home)
         .env_remove("KINBASE_COMPANY_URL");
+    for candidate in candidates {
+        command.args(["--candidate", candidate]);
+    }
     if apply {
         command.arg("--apply");
     }
     command
+}
+
+fn abandon_fanout(world: &Certified, destination: &str, apply: bool) -> Output {
+    abandon_fanout_command(world, destination, apply, &[])
         .output_alone()
         .expect("run kinbase session abandon-fanout")
 }
 
-/// A fan-out journal as a Company retry that came back pending leaves it.
-fn plant_fanout(world: &Certified, candidate: &str, destination: &str, done: bool) {
+/// The JSON report of a run that must succeed.
+fn abandon_report(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("abandon-fanout JSON")
+}
+
+fn read_marker(path: PathBuf) -> Value {
+    serde_json::from_slice(&fs::read(path).expect("marker")).expect("marker JSON")
+}
+
+/// One journal marker, as `FanoutJournal::write` leaves it.
+fn plant_marker(
+    world: &Certified,
+    candidate: &str,
+    destination: &str,
+    transition: &str,
+    state: &str,
+    extra: Value,
+) {
     let dir = world.repo.join(".kin/local/journal/fanout").join(candidate);
-    let marker = |transition: &str, state: &str, extra: Value| {
-        let mut marker = json!({
-            "schema": "kinbase-fanout-journal/1",
-            "candidate_id": candidate,
-            "destination": destination,
-            "transition": transition,
-            "journal_state": state,
-            "updated_at": "2026-10-17T03:52:55.000Z"
-        });
-        if let (Value::Object(target), Value::Object(source)) = (&mut marker, extra) {
-            target.extend(source);
-        }
-        private_write(
-            &dir.join(format!("{transition}.json")),
-            kinbase::json::canonical_text(&marker).as_bytes(),
-        );
-    };
-    marker(
+    let mut marker = json!({
+        "schema": "kinbase-fanout-journal/1",
+        "candidate_id": candidate,
+        "destination": destination,
+        "transition": transition,
+        "journal_state": state,
+        "updated_at": "2026-10-17T03:52:55.000Z"
+    });
+    if let (Value::Object(target), Value::Object(source)) = (&mut marker, extra) {
+        target.extend(source);
+    }
+    private_write(
+        &dir.join(format!("{transition}.json")),
+        kinbase::json::canonical_text(&marker).as_bytes(),
+    );
+}
+
+/// The nonce reservation an admission binds before it sends to Company.
+fn plant_reservation(world: &Certified, candidate: &str, destination: &str) {
+    plant_marker(
+        world,
+        candidate,
+        destination,
         "nonce_reservation",
         "nonce_reserved",
-        json!({"receipt_id": format!("receipt_{candidate}"), "payload_digest": format!("digest_{candidate}")}),
+        json!({
+            "receipt_id": format!("receipt_{candidate}"),
+            "payload_digest": format!("digest_{candidate}"),
+            "event_canonical": "{}"
+        }),
     );
-    marker(
+}
+
+/// A fan-out journal as a Company retry that came back pending leaves it.
+fn plant_fanout(world: &Certified, candidate: &str, destination: &str, done: bool) {
+    plant_reservation(world, candidate, destination);
+    plant_marker(
+        world,
+        candidate,
+        destination,
         "receipt",
         "receipt_written",
         json!({"state": "pending", "receipt_id": format!("receipt_{candidate}"), "apology_ids": ["apology_kept"]}),
     );
     if done {
-        marker("done", "done", json!({}));
+        plant_marker(world, candidate, destination, "done", "done", json!({}));
     }
+}
+
+/// Register candidates in the personal candidate journal.
+fn plant_candidates(world: &Certified, candidates: &[(&str, &str)]) {
+    let records: Vec<Value> = candidates
+        .iter()
+        .map(|(id, destination)| json!({"candidate_id": id, "destination": destination}))
+        .collect();
+    private_write(&world.personal.join("candidates.jsonl"), &jsonl(&records));
 }
 
 fn decisions(world: &Certified) -> Vec<Value> {
@@ -571,11 +630,17 @@ fn abandon_fanout_settles_only_the_named_company_destination() {
 #[test]
 fn abandon_fanout_refuses_a_non_company_destination() {
     let world = certified();
-    let output = abandon_fanout(&world, &format!("codebase:{REPOSITORY}"), true);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("only a Company fan-out"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // `companyfoo` shares the prefix but names no Company scope.
+    for destination in [format!("codebase:{REPOSITORY}"), "companyfoo".to_owned()] {
+        let output = abandon_fanout(&world, &destination, true);
+        assert!(!output.status.success(), "{destination} was accepted");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("only a Company fan-out"),
+            "{destination}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The bare label is still the Company store (`destination_store`).
+    let report = abandon_report(&abandon_fanout(&world, "company", false));
+    assert_eq!(report["fanouts"], json!([]));
 }

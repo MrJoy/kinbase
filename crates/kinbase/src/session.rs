@@ -3987,7 +3987,13 @@ pub fn abandon_fanouts(
     apply: bool,
     json: bool,
 ) -> Result<(), ContractError> {
-    if !destination.starts_with("company") {
+    // The bare label is the Company store too (`destination_store`); any
+    // other name only shares the prefix.
+    let company = destination == "company"
+        || destination
+            .strip_prefix("company:")
+            .is_some_and(|scope| !scope.is_empty());
+    if !company {
         return Err(ContractError::refused(
             "AUTHORITY_SCOPE_DENIED",
             "only a Company fan-out can be abandoned",

@@ -807,6 +807,42 @@ fn abandon_fanout_keeps_a_receipt_company_already_settled() {
     assert!(decisions(&world).is_empty());
 }
 
+/// Wait until `child` queues on the admission lock the test holds. A waiter
+/// holds the lock's turnstile until it gets the lock, so a turnstile this
+/// test cannot take means the child is waiting. False if the child exited
+/// first.
+fn queued_on_admission_lock(world: &Certified, child: &mut std::process::Child) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let turnstile = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(
+            world
+                .repo
+                .join(format!(".git/kinbase-{REPOSITORY}.turnstile.lock")),
+        )
+        .expect("open admission lock turnstile");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        // SAFETY: flock on a descriptor this test owns.
+        if unsafe { libc::flock(turnstile.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return true;
+        }
+        unsafe {
+            libc::flock(turnstile.as_raw_fd(), libc::LOCK_UN);
+        }
+        if child.try_wait().expect("poll abandon-fanout").is_some() {
+            return false;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "abandon-fanout neither queued on the admission lock nor exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn abandon_fanout_rechecks_the_journal_under_the_admission_lock() {
     use std::os::fd::AsRawFd as _;
@@ -825,14 +861,17 @@ fn abandon_fanout_rechecks_the_journal_under_the_admission_lock() {
         .expect("open admission lock");
     // SAFETY: flock on a descriptor this test owns.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-    let child = abandon_fanout_command(&world, stuck, true, &[])
+    let mut child = abandon_fanout_command(&world, stuck, true, &[])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn_alone()
         .expect("spawn kinbase session abandon-fanout");
-    // Let it read the pending journal and queue on the lock.
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // It has read the pending journal and queued on the lock.
+    assert!(
+        queued_on_admission_lock(&world, &mut child),
+        "abandon --apply settled the saga without waiting for the admission lock"
+    );
     // The recovery commits and finishes, then releases the lock.
     plant_committed_receipt(&world, "cand_racing", stuck);
     plant_marker(&world, "cand_racing", stuck, "done", "done", json!({}));

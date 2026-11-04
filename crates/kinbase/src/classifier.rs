@@ -1237,12 +1237,13 @@ fn is_nonfact_statement(text: &str) -> bool {
 /// word claims it only right after an organization word, so "company
 /// governance" is Company while "the governance guard" is not.
 fn is_company_statement(lower: &str) -> bool {
-    const OWNERSHIP_PHRASES: [&str; 11] = [
+    const OWNERSHIP_PHRASES: [&str; 12] = [
         "architecture decision",
         "architecture direction",
         "chief architect",
         "company-wide",
         "organization-wide",
+        "organisation-wide",
         "org-wide",
         "product policy",
         "company decision",
@@ -2125,5 +2126,14 @@ mod tests {
                 "an ownership claim was not Company: {text}"
             );
         }
+    }
+
+    #[test]
+    fn organisation_wide_claims_company_ownership() {
+        let text = "Organisation-wide, retention is owned by the architecture authority.";
+        assert!(
+            is_company_statement(&text.to_lowercase()),
+            "an ownership claim was not Company: {text}"
+        );
     }
 }

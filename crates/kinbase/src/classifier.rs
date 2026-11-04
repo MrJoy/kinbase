@@ -1269,9 +1269,13 @@ fn is_company_statement(lower: &str) -> bool {
         "steward",
         "stewards",
     ];
+    // Framed on word boundaries, as is_unsettled_claim is: "small teams" is
+    // not "all teams" and "every teammate" is not "every team". The phrase is
+    // framed too, so "company-wide" reads as the words "company wide".
+    let frame = word_frame(lower);
     if OWNERSHIP_PHRASES
         .iter()
-        .any(|phrase| lower.contains(phrase))
+        .any(|phrase| frame_contains(&frame, word_frame(phrase).trim()))
     {
         return true;
     }
@@ -2074,6 +2078,36 @@ mod tests {
             assert!(
                 is_company_statement(&text.to_lowercase()),
                 "an ownership claim was not Company: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ownership_phrase_matches_whole_words_only() {
+        // "small teams" holds "all teams" and "every teammate" holds "every
+        // team" as substrings; neither is an organization-wide claim.
+        let mentions = [
+            "Small teams ship faster.",
+            "The overall teams page loads slowly.",
+            "Every teammate reviewed the diff.",
+        ];
+        for text in mentions {
+            assert!(
+                !is_company_statement(&text.to_lowercase()),
+                "a substring claimed Company ownership: {text}"
+            );
+        }
+        let claims = [
+            "All teams must sign releases.",
+            "Every team owns its on-call rota.",
+            "Company-wide, releases are signed.",
+            "Retention is an org-wide rule.",
+            "The chief architect approved the change.",
+        ];
+        for text in claims {
+            assert!(
+                is_company_statement(&text.to_lowercase()),
+                "an ownership phrase was not Company: {text}"
             );
         }
     }

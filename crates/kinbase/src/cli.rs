@@ -70,11 +70,37 @@ fn usage_error(_args: &[String], _detail: String) -> ContractError {
 fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
     let launcher = crate::launcher::Launcher::load()?;
     match command {
+        Command::Auth(AuthCommand::Login) => {
+            let config = launcher
+                .user
+                .as_ref()
+                .map_or(Ok(None), crate::config::UserConfig::oidc)?
+                .ok_or_else(|| ContractError::invariant("OIDC is not configured"))?;
+            let email = crate::oidc::login(&config, json)?;
+            if json {
+                crate::output::emit(&serde_json::json!({"signed_in_as": email}), true);
+            } else {
+                println!("signed in as {email}");
+            }
+        }
         Command::Company(CompanyCommand::Init { config }) => {
             crate::company::init(&config, json).map_err(internal)?;
         }
         Command::Company(CompanyCommand::Serve { config }) => {
             crate::company::serve(&config, json).map_err(internal)?;
+        }
+        Command::Company(CompanyCommand::Usage {
+            config,
+            since,
+            until,
+            bucket,
+        }) => {
+            let bucket = match bucket {
+                UsageBucket::Day => crate::usage::Bucket::Day,
+                UsageBucket::Hour => crate::usage::Bucket::Hour,
+            };
+            crate::company::usage(&config, since.as_deref(), until.as_deref(), bucket, json)
+                .map_err(internal)?;
         }
         Command::Repo(RepoCommand::Issue { repo, company }) => {
             crate::repository::issue_certificate(launcher, &repo, &company, json)

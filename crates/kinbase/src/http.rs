@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -17,6 +18,16 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 2048 + 64;
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_ERROR_BODY_BYTES: usize = 4096;
 pub const CONNECT_BUDGET: Duration = Duration::from_millis(250);
+const TLS_CONNECT_BUDGET: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    Http,
+    Https,
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
 
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -303,15 +314,31 @@ pub fn error_body(error: &ContractError) -> Value {
 pub fn parse_url(
     url: &str,
     allow_non_loopback: bool,
-) -> Result<(String, u16, String), ContractError> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| ContractError::invariant("Company URL must use http:// over loopback"))?;
+    oidc: bool,
+) -> Result<(Scheme, String, u16, String), ContractError> {
+    let (scheme, rest, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (Scheme::Http, rest, "80")
+    } else if let Some(rest) = url.strip_prefix("https://").filter(|_| oidc) {
+        (Scheme::Https, rest, "443")
+    } else if !oidc {
+        return Err(ContractError::invariant(
+            "Company URL must use http:// over loopback",
+        ));
+    } else {
+        return Err(ContractError::invariant("URL must use http:// or https://"));
+    };
+    if oidc && url.bytes().any(|byte| byte <= b' ' || byte == 127) {
+        return Err(ContractError::invariant(
+            "URL contains whitespace or a control byte",
+        ));
+    }
     let (authority, path) = rest
         .split_once('/')
         .map(|(a, p)| (a, format!("/{p}")))
         .unwrap_or((rest, String::new()));
-    let (host, port) = authority.rsplit_once(':').unwrap_or((authority, "80"));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or((authority, default_port));
     let host = host.trim_start_matches('[').trim_end_matches(']');
     // `http://:8421` names no host at all. While the endpoint had to be
     // loopback that was refused by the rule below; once a routable endpoint is
@@ -333,12 +360,12 @@ pub fn parse_url(
             "Company URL must name a loopback host",
         ));
     }
-    let host = if host == "localhost" {
+    let host = if host == "localhost" && scheme == Scheme::Http {
         "127.0.0.1".to_owned()
     } else {
         host.to_owned()
     };
-    Ok((host, port, path.trim_end_matches('/').to_owned()))
+    Ok((scheme, host, port, path.trim_end_matches('/').to_owned()))
 }
 
 pub struct Response {
@@ -369,7 +396,7 @@ pub const RESOLVE_BUDGET: Duration = Duration::from_millis(250);
 /// as a slow resolver and sent the reader to the network for a fault in this
 /// process.
 #[derive(Debug, PartialEq, Eq)]
-enum Abandoned {
+pub(crate) enum Abandoned {
     /// The budget ran out with the work still in flight.
     Budget,
     /// The thread ended without sending, or never started at all.
@@ -388,10 +415,15 @@ enum Abandoned {
 /// This exists as its own function so the bound can be tested against work that
 /// is deliberately slow. A test that only resolves real names proves nothing on
 /// a machine whose resolver is fast.
-fn within<T: Send + 'static>(
+pub(crate) fn within<T: Send + 'static>(
     budget: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Abandoned> {
+    // recv_timeout(0) still returns an answer that is already waiting, so work
+    // that finishes at once (an IP literal resolves instantly) beat a spent budget.
+    if budget.is_zero() {
+        return Err(Abandoned::Budget);
+    }
     let (sender, receiver) = std::sync::mpsc::channel();
     if let Err(error) = std::thread::Builder::new().spawn(move || {
         let _ = sender.send(work());
@@ -496,10 +528,12 @@ pub fn probe_connect(host: &str, port: u16) -> Result<(), ContractError> {
         })
 }
 
-/// One client request with the 250 ms connection budget and bounded
+/// One client request with the 250 ms (HTTPS: 2 s) connection budget and bounded
 /// read/write timeouts. Any failure to connect or answer within budget is
 /// `COMPANY_UNREACHABLE`.
+#[allow(clippy::too_many_arguments)]
 pub fn request(
+    scheme: Scheme,
     host: &str,
     port: u16,
     method: &str,
@@ -508,25 +542,57 @@ pub fn request(
     body: &[u8],
     read_timeout: Duration,
 ) -> Result<Response, ContractError> {
-    let addresses = resolve_within(host, port, RESOLVE_BUDGET)?;
-    let mut stream = connect_within(&addresses, CONNECT_BUDGET).map_err(|kind| {
+    let budget = if scheme == Scheme::Https {
+        TLS_CONNECT_BUDGET
+    } else {
+        CONNECT_BUDGET
+    };
+    let addresses = resolve_within(host, port, budget)?;
+    let mut tcp = connect_within(&addresses, budget).map_err(|kind| {
         ContractError::unreachable(format!(
             "Company endpoint did not accept a connection within {} ms ({kind})",
-            CONNECT_BUDGET.as_millis()
+            budget.as_millis()
         ))
     })?;
-    stream
-        .set_read_timeout(Some(read_timeout))
+    tcp.set_read_timeout(Some(read_timeout))
         .map_err(|error| ContractError::io("read timeout", error))?;
-    stream
-        .set_write_timeout(Some(read_timeout))
+    tcp.set_write_timeout(Some(read_timeout))
         .map_err(|error| ContractError::io("write timeout", error))?;
-    let _ = stream.set_nodelay(true);
+    let _ = tcp.set_nodelay(true);
+    let mut tls;
+    let stream: &mut dyn ReadWrite = match scheme {
+        Scheme::Http => &mut tcp,
+        Scheme::Https => {
+            static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+            let config = CONFIG.get_or_init(|| {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+                Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),
+                )
+            });
+            let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+                .map_err(|_| ContractError::invariant("TLS endpoint has an invalid server name"))?;
+            let connection = rustls::ClientConnection::new(Arc::clone(config), name)
+                .map_err(|_| ContractError::unreachable("TLS setup failed"))?;
+            tls = rustls::StreamOwned::new(connection, tcp);
+            tls.conn.complete_io(&mut tls.sock).map_err(|error| {
+                ContractError::unreachable(format!("TLS handshake failed ({error})"))
+            })?;
+            &mut tls
+        }
+    };
     let mut text = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
-    if !body.is_empty() {
+    if !body.is_empty()
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+    {
         text.push_str("Content-Type: application/json\r\n");
     }
     for (name, value) in headers {
@@ -539,6 +605,7 @@ pub fn request(
     stream
         .write_all(text.as_bytes())
         .and_then(|_| stream.write_all(body))
+        .and_then(|_| stream.flush())
         .map_err(|error| {
             ContractError::unreachable(format!(
                 "Company endpoint refused the request bytes ({})",
@@ -569,7 +636,8 @@ pub fn request(
         .ok_or_else(|| {
             ContractError::unreachable("Company endpoint answered with a malformed status line")
         })?;
-    let mut content_length = 0usize;
+    let mut content_length = None;
+    let mut chunked = false;
     loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line).map_err(|error| {
@@ -583,7 +651,11 @@ pub fn request(
         }
         if let Some((name, value)) = line.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().unwrap_or(0);
+                content_length = Some(value.trim().parse().unwrap_or(0));
+            } else if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
             }
         }
     }
@@ -593,14 +665,31 @@ pub fn request(
     // direction. Responses are signed and verified after this bound, so the
     // bound only protects memory. The full Company snapshot with the corpus is
     // 40 MB at 10,910 facts, so 8 MiB refused every sync.
-    if content_length > MAX_BODY_BYTES * 512 {
+    let limit = MAX_BODY_BYTES * 512;
+    if content_length.is_some_and(|length| length > limit) {
         return Err(ContractError::limit(
             "Company response exceeds the bounded body size",
             serde_json::json!({"refused_count": 1, "omitted_count": 1, "bytes": content_length}),
         ));
     }
-    let mut raw = vec![0u8; content_length];
-    if content_length > 0 {
+    let mut raw = vec![0u8; content_length.unwrap_or(0)];
+    if chunked || content_length.is_none() {
+        raw.clear();
+        let read = reader.by_ref().take(limit as u64 + 1).read_to_end(&mut raw);
+        if read.is_err() && (!chunked || raw.is_empty()) {
+            return Err(ContractError::unreachable("Company response truncated"));
+        }
+        if raw.len() > limit {
+            return Err(ContractError::limit(
+                "Company response exceeds the bounded body size",
+                serde_json::json!({"refused_count": 1, "omitted_count": 1}),
+            ));
+        }
+        if chunked {
+            raw = crate::classifier::decode_chunked(&raw)
+                .map_err(|_| ContractError::unreachable("Company response truncated"))?;
+        }
+    } else if !raw.is_empty() {
         reader.read_exact(&mut raw).map_err(|error| {
             ContractError::unreachable(format!("Company response truncated ({})", error.kind()))
         })?;
@@ -896,8 +985,8 @@ mod endpoint_url_tests {
     /// COMPANY_UNREACHABLE, which points at a healthy network.
     #[test]
     fn a_company_url_with_no_host_is_refused_as_configuration() {
-        let error =
-            parse_url("http://:8421/base", true).expect_err("a URL naming no host was accepted");
+        let error = parse_url("http://:8421/base", true, false)
+            .expect_err("a URL naming no host was accepted");
         assert_eq!(error.code, "CONFIG_INVARIANT");
     }
 }

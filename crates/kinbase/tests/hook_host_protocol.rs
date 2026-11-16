@@ -67,7 +67,21 @@ fn world(temp: &TempDir) -> World {
 }
 
 fn kinbase(world: &World, args: &[&str], envs: &[(&str, &Path)], stdin: &[u8]) -> Output {
+    kinbase_inheriting(world, args, envs, stdin, None)
+}
+
+/// [`kinbase`], with `inherit` open as descriptor 9 in the child, the way a
+/// host leaks one into its hook.
+fn kinbase_inheriting(
+    world: &World,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+    stdin: &[u8],
+    inherit: Option<&Path>,
+) -> Output {
     use std::io::Write as _;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
     let path = format!(
         "{}:{}",
         world.bin.display(),
@@ -89,6 +103,25 @@ fn kinbase(world: &World, args: &[&str], envs: &[(&str, &Path)], stdin: &[u8]) -
         .stderr(Stdio::piped());
     for (key, value) in envs {
         command.env(key, value);
+    }
+    let leaked = inherit.map(|path| fs::File::open(path).expect("open leaked descriptor"));
+    if let Some(source) = leaked.as_ref().map(AsRawFd::as_raw_fd) {
+        // SAFETY: dup2 and fcntl are async-signal-safe. Descriptor 9 ends up
+        // without close-on-exec, so the child inherits it; when the file
+        // already is 9, dup2 is a no-op and the flag is cleared directly.
+        unsafe {
+            command.pre_exec(move || {
+                let result = if source == 9 {
+                    libc::fcntl(9, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(source, 9)
+                };
+                if result < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = command.spawn_alone().expect("spawn kinbase");
     child
@@ -715,13 +748,8 @@ fn a_precompact_checkpoints_the_session_and_allows_the_compaction() {
     assert!(!world.personal.join("session-checkpoints.jsonl").exists());
 }
 
-/// `hooks dispatch` with `inherit` open as descriptor 9 in the child, the way
-/// a host leaks one into its hook.
+/// A Codex PreToolUse dispatch with `inherit` leaked into it.
 fn dispatch_with_inherited(world: &World, inherit: &Path) -> Output {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-    let leaked = fs::File::open(inherit).expect("open leaked descriptor");
-    let source = leaked.as_raw_fd();
     let envelope = json!({
         "session_id": "host-session-leak",
         "cwd": world.repo.display().to_string(),
@@ -729,37 +757,13 @@ fn dispatch_with_inherited(world: &World, inherit: &Path) -> Output {
         "tool_name": "Bash",
         "tool_input": {}
     });
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kinbase"));
-    command
-        .current_dir(&world.repo)
-        .args(["hooks", "dispatch", "codex", "PreToolUse"])
-        .env("HOME", &world.home)
-        .env("XDG_CONFIG_HOME", world.home.join(".config"))
-        .env("XDG_STATE_HOME", world.home.join(".state"))
-        .env_remove("CODEX_HOME")
-        .env_remove("KINBASE_COMPANY_URL")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: dup2 is async-signal-safe; it leaves descriptor 9 without
-    // close-on-exec, so the child inherits it.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(source, 9) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn_alone().expect("spawn kinbase");
-    use std::io::Write as _;
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(envelope.to_string().as_bytes())
-        .expect("stdin");
-    child.wait_with_output().expect("output")
+    kinbase_inheriting(
+        world,
+        &["hooks", "dispatch", "codex", "PreToolUse"],
+        &[],
+        envelope.to_string().as_bytes(),
+        Some(inherit),
+    )
 }
 
 #[test]
@@ -769,6 +773,12 @@ fn a_descriptor_the_host_leaked_does_not_fail_the_hook() {
     let stray = temp.path().join("host-pipe-stand-in");
     fs::write(&stray, b"").expect("stray file");
     let output = dispatch_with_inherited(&world, &stray);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(r#"{"kinbase":"closed_inherited_descriptors","descriptors":[9]}"#),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.status.success(),
         "exit {:?}: {} {}",

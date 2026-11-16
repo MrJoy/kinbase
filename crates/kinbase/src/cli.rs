@@ -68,14 +68,10 @@ fn usage_error(_args: &[String], _detail: String) -> ContractError {
 }
 
 fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
-    if matches!(
-        command,
-        Command::Hooks(crate::command_types::HookCommand::Dispatch { .. })
-    ) {
+    if matches!(command, Command::Hooks(HookCommand::Dispatch { .. })) {
         // The host, not kinbase, launched this process: drop what it leaked
         // instead of failing every hook (exit 4) on it.
-        let personal_root = crate::config::load_user_config()?.map(|user| user.personal.data_root);
-        crate::sandbox::close_stray_descriptors(personal_root.as_deref());
+        crate::sandbox::mark_host_launched();
     }
     let launcher = crate::launcher::Launcher::load()?;
     match command {

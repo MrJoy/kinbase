@@ -146,24 +146,14 @@ pub fn dir_identity(path: &Path) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
-/// Close every inherited descriptor outside the allowlist that is not under
-/// the Personal root, so the process no longer holds it. For host hooks only:
-/// the host (Codex, Claude Code) is the parent, and Codex passes every hook
-/// a descriptor kinbase cannot refuse at launch. A Personal descriptor stays
-/// open so [`attest_descriptors`] still fails startup on it.
-pub fn close_stray_descriptors(personal_root: Option<&Path>) {
-    let allow = allowlist();
-    let personal_identity = personal_root.and_then(dir_identity);
-    let personal_canonical = personal_root.and_then(|root| root.canonicalize().ok());
-    for descriptor in open_descriptors() {
-        if !allow.contains(&descriptor.fd)
-            && !under_personal(&descriptor, personal_identity, personal_canonical.as_deref())
-        {
-            // SAFETY: runs before this process wraps any descriptor in an
-            // owned handle, so nothing else refers to the one closed here.
-            unsafe { libc::close(descriptor.fd) };
-        }
-    }
+/// Set when a host (Codex, Claude Code), not kinbase, launched this process
+/// as a hook: [`attest_descriptors`] then closes stray inherited descriptors
+/// instead of refusing, since kinbase cannot constrain what the host passes.
+static HOST_LAUNCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as host-launched; call before the first launcher load.
+pub fn mark_host_launched() {
+    HOST_LAUNCHED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether `descriptor` is the Personal root or resolves under it.
@@ -199,6 +189,26 @@ pub fn attest_descriptors(personal_root: Option<&Path>) -> Result<Value, Contrac
         if !allow.contains(&descriptor.fd) {
             extra.push(descriptor.fd);
         }
+    }
+    if !extra.is_empty() && HOST_LAUNCHED.load(std::sync::atomic::Ordering::Relaxed) {
+        // No Personal descriptor is present (checked above). Closing the rest
+        // means shared work never holds them; say which, without paths.
+        for fd in &extra {
+            // SAFETY: attestation runs before this process wraps any
+            // descriptor in an owned handle, so nothing else refers to it.
+            unsafe { libc::close(*fd) };
+        }
+        eprintln!(
+            "{}",
+            json!({"kinbase": "closed_inherited_descriptors", "descriptors": extra})
+        );
+        return Ok(json!({
+            "allowlist": allow,
+            "open_descriptors": descriptors.iter().map(|d| d.fd).filter(|fd| !extra.contains(fd)).collect::<Vec<_>>(),
+            "closed_host_descriptors": extra,
+            "personal_descriptor_present": false,
+            "facility": if cfg!(target_os = "macos") { "fcntl(F_GETFD)+fstat+F_GETPATH" } else { "fcntl(F_GETFD)+fstat+/proc/self/fd" }
+        }));
     }
     if !extra.is_empty() {
         return Err(ContractError::refused(

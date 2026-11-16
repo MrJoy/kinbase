@@ -8,9 +8,8 @@ Notable changes to Kinbase. Dates are UTC.
 
 - `hooks dispatch` no longer exits 4 (`CONFIG_INVARIANT`, "inherited
   descriptor(s) outside the frozen allowlist") when the host leaks an open
-  descriptor into the hook, as Codex does on every hook. The hook closes such
-  descriptors before startup attestation; one under the Personal root still
-  fails it.
+  descriptor into the hook. Startup attestation closes such descriptors for a
+  hook and names them on stderr; one under the Personal root still fails it.
 
 ### Changed
 

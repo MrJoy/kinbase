@@ -10,6 +10,7 @@ Notable changes to Kinbase. Dates are UTC.
   descriptor(s) outside the frozen allowlist") when the host leaks an open
   descriptor into the hook. Startup attestation closes such descriptors for a
   hook and names them on stderr; one under the Personal root still fails it.
+  Candidate spec amendment 004 records the change.
 
 ### Changed
 

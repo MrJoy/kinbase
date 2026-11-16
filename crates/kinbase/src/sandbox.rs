@@ -148,7 +148,8 @@ pub fn dir_identity(path: &Path) -> Option<(u64, u64)> {
 
 /// Set when a host (Codex, Claude Code), not kinbase, launched this process
 /// as a hook: [`attest_descriptors`] then closes stray inherited descriptors
-/// instead of refusing, since kinbase cannot constrain what the host passes.
+/// instead of refusing, since kinbase cannot constrain what the host passes
+/// (`spec/amendment-004-host-launched-hook-descriptors.md`).
 static HOST_LAUNCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Mark this process as host-launched; call before the first launcher load.

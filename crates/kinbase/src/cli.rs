@@ -68,6 +68,11 @@ fn usage_error(_args: &[String], _detail: String) -> ContractError {
 }
 
 fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
+    if matches!(command, Command::Hooks(HookCommand::Dispatch { .. })) {
+        // The host, not kinbase, launched this process: drop what it leaked
+        // instead of failing every hook (exit 4) on it.
+        crate::sandbox::mark_host_launched();
+    }
     let launcher = crate::launcher::Launcher::load()?;
     match command {
         Command::Auth(AuthCommand::Login) => {

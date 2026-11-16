@@ -714,3 +714,80 @@ fn a_precompact_checkpoints_the_session_and_allows_the_compaction() {
     assert_eq!(receipt["checkpoint_recorded"], false, "{receipt}");
     assert!(!world.personal.join("session-checkpoints.jsonl").exists());
 }
+
+/// `hooks dispatch` with `inherit` open as descriptor 9 in the child, the way
+/// a host leaks one into its hook.
+fn dispatch_with_inherited(world: &World, inherit: &Path) -> Output {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let leaked = fs::File::open(inherit).expect("open leaked descriptor");
+    let source = leaked.as_raw_fd();
+    let envelope = json!({
+        "session_id": "host-session-leak",
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {}
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kinbase"));
+    command
+        .current_dir(&world.repo)
+        .args(["hooks", "dispatch", "codex", "PreToolUse"])
+        .env("HOME", &world.home)
+        .env("XDG_CONFIG_HOME", world.home.join(".config"))
+        .env("XDG_STATE_HOME", world.home.join(".state"))
+        .env_remove("CODEX_HOME")
+        .env_remove("KINBASE_COMPANY_URL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: dup2 is async-signal-safe; it leaves descriptor 9 without
+    // close-on-exec, so the child inherits it.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source, 9) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn_alone().expect("spawn kinbase");
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelope.to_string().as_bytes())
+        .expect("stdin");
+    child.wait_with_output().expect("output")
+}
+
+#[test]
+fn a_descriptor_the_host_leaked_does_not_fail_the_hook() {
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let stray = temp.path().join("host-pipe-stand-in");
+    fs::write(&stray, b"").expect("stray file");
+    let output = dispatch_with_inherited(&world, &stray);
+    assert!(
+        output.status.success(),
+        "exit {:?}: {} {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn a_leaked_personal_descriptor_still_fails_the_hook() {
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let output = dispatch_with_inherited(&world, &world.personal);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Personal root"));
+}

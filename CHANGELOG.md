@@ -4,6 +4,14 @@ Notable changes to Kinbase. Dates are UTC.
 
 ## Unreleased
 
+### Fixed
+
+- `hooks dispatch` no longer exits 4 (`CONFIG_INVARIANT`, "inherited
+  descriptor(s) outside the frozen allowlist") when the host leaks an open
+  descriptor into the hook, as Codex on macOS does when the hook starts while
+  another of its threads is creating a pipe. The hook closes such descriptors
+  before startup attestation; one under the Personal root still fails it.
+
 ### Changed
 
 - A statement goes to the Company only when it claims organization-wide

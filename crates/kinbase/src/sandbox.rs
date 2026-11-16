@@ -146,6 +146,39 @@ pub fn dir_identity(path: &Path) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
+/// Close every inherited descriptor outside the allowlist that is not under
+/// the Personal root, so the process no longer holds it. For host hooks only:
+/// the host (Codex, Claude Code) is the parent and leaks descriptors kinbase
+/// cannot refuse at launch (on macOS a pipe another host thread is creating
+/// is inherited before it becomes close-on-exec). A Personal descriptor stays
+/// open so [`attest_descriptors`] still fails startup on it.
+pub fn close_stray_descriptors(personal_root: Option<&Path>) {
+    let allow = allowlist();
+    let personal_identity = personal_root.and_then(dir_identity);
+    let personal_canonical = personal_root.and_then(|root| root.canonicalize().ok());
+    for descriptor in open_descriptors() {
+        if !allow.contains(&descriptor.fd)
+            && !under_personal(&descriptor, personal_identity, personal_canonical.as_deref())
+        {
+            // SAFETY: runs before this process wraps any descriptor in an
+            // owned handle, so nothing else refers to the one closed here.
+            unsafe { libc::close(descriptor.fd) };
+        }
+    }
+}
+
+/// Whether `descriptor` is the Personal root or resolves under it.
+fn under_personal(
+    descriptor: &OpenDescriptor,
+    identity: Option<(u64, u64)>,
+    canonical: Option<&Path>,
+) -> bool {
+    identity.is_some_and(|(dev, ino)| descriptor.dev == dev && descriptor.ino == ino)
+        || canonical
+            .zip(descriptor.path.as_ref())
+            .is_some_and(|(root, path)| path.starts_with(root))
+}
+
 /// Startup attestation: refuse any inherited descriptor under the Personal
 /// root (by device/inode or resolved path) and any descriptor outside the
 /// frozen allowlist. Returns the attestation record for `doctor`.
@@ -156,11 +189,7 @@ pub fn attest_descriptors(personal_root: Option<&Path>) -> Result<Value, Contrac
     let personal_canonical = personal_root.and_then(|root| root.canonicalize().ok());
     let mut extra = Vec::new();
     for descriptor in &descriptors {
-        let under_personal = personal_identity
-            .is_some_and(|(dev, ino)| descriptor.dev == dev && descriptor.ino == ino)
-            || (personal_canonical.as_ref().zip(descriptor.path.as_ref()))
-                .is_some_and(|(root, path)| path.starts_with(root));
-        if under_personal {
+        if under_personal(descriptor, personal_identity, personal_canonical.as_deref()) {
             return Err(ContractError::refused(
                 "CONFIG_INVARIANT",
                 format!("inherited descriptor {} resolves under the Personal root; shared work refused before any side effect", descriptor.fd),

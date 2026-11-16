@@ -148,9 +148,8 @@ pub fn dir_identity(path: &Path) -> Option<(u64, u64)> {
 
 /// Close every inherited descriptor outside the allowlist that is not under
 /// the Personal root, so the process no longer holds it. For host hooks only:
-/// the host (Codex, Claude Code) is the parent and leaks descriptors kinbase
-/// cannot refuse at launch (on macOS a pipe another host thread is creating
-/// is inherited before it becomes close-on-exec). A Personal descriptor stays
+/// the host (Codex, Claude Code) is the parent, and Codex passes every hook
+/// a descriptor kinbase cannot refuse at launch. A Personal descriptor stays
 /// open so [`attest_descriptors`] still fails startup on it.
 pub fn close_stray_descriptors(personal_root: Option<&Path>) {
     let allow = allowlist();

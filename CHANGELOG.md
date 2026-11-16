@@ -19,6 +19,16 @@ Notable changes to Kinbase. Dates are UTC.
   in `companies/<name>/oidc.json` beside its keys; `auth login` signs in to
   the Company the working directory selects.
 
+### Changed
+
+- A statement goes to the Company only when it claims organization-wide
+  ownership. A phrase such as "company-wide", "organization-wide" or "all
+  teams" counts on its own, matched as whole words. A topic word (`policy`,
+  `standard`, `governance`, `roadmap`, `steward`) counts only right after an
+  organization word ("company policy", "the organization's roadmap").
+  "The governance guard blocks the edit" and "incorporate" no longer route to
+  the Company. (#43)
+
 ## 0.1.2 - 2026-10-30
 
 ### Fixed

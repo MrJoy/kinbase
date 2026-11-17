@@ -615,14 +615,10 @@ pub fn request(
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
     reader.read_line(&mut status_line).map_err(|error| {
-        ContractError::unreachable(format!(
-            "Company endpoint did not answer within the read budget ({})",
-            error.kind()
-        ))
-        .with_detail(serde_json::json!({
-            "timeout_observed": true,
-            "omitted_count": 1
-        }))
+        read_failure(
+            "Company endpoint did not answer within the read budget",
+            error.kind(),
+        )
     })?;
     if status_line.is_empty() {
         return Err(ContractError::unreachable(
@@ -640,12 +636,9 @@ pub fn request(
     let mut chunked = false;
     loop {
         let mut line = String::new();
-        let read = reader.read_line(&mut line).map_err(|error| {
-            ContractError::unreachable(format!(
-                "Company endpoint headers unreadable ({})",
-                error.kind()
-            ))
-        })?;
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| read_failure("Company endpoint headers unreadable", error.kind()))?;
         if read == 0 || line.trim().is_empty() {
             break;
         }
@@ -676,8 +669,10 @@ pub fn request(
     if chunked || content_length.is_none() {
         raw.clear();
         let read = reader.by_ref().take(limit as u64 + 1).read_to_end(&mut raw);
-        if read.is_err() && (!chunked || raw.is_empty()) {
-            return Err(ContractError::unreachable("Company response truncated"));
+        if let Err(error) = &read
+            && (!chunked || raw.is_empty())
+        {
+            return Err(read_failure("Company response truncated", error.kind()));
         }
         if raw.len() > limit {
             return Err(ContractError::limit(
@@ -686,13 +681,15 @@ pub fn request(
             ));
         }
         if chunked {
-            raw = crate::classifier::decode_chunked(&raw)
-                .map_err(|_| ContractError::unreachable("Company response truncated"))?;
+            raw = crate::classifier::decode_chunked(&raw).map_err(|_| match &read {
+                Err(error) => read_failure("Company response truncated", error.kind()),
+                Ok(_) => ContractError::unreachable("Company response truncated"),
+            })?;
         }
     } else if !raw.is_empty() {
-        reader.read_exact(&mut raw).map_err(|error| {
-            ContractError::unreachable(format!("Company response truncated ({})", error.kind()))
-        })?;
+        reader
+            .read_exact(&mut raw)
+            .map_err(|error| read_failure("Company response truncated", error.kind()))?;
     }
     let body = if raw.is_empty() {
         Value::Null
@@ -701,6 +698,76 @@ pub fn request(
             .unwrap_or_else(|_| serde_json::from_slice(&raw).unwrap_or(Value::Null))
     };
     Ok(Response { status, body, raw })
+}
+
+/// A failed read of a Company answer. Every phase (status line, headers,
+/// body) waits on the same read budget, so each says whether the budget ran
+/// out: a timeout surfaces as WouldBlock on macOS and TimedOut on Linux, while
+/// a reset or other read error is not a spent budget.
+fn read_failure(message: &str, kind: std::io::ErrorKind) -> ContractError {
+    ContractError::unreachable(format!("{message} ({kind})")).with_detail(serde_json::json!({
+        "timeout_observed": matches!(
+            kind,
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "omitted_count": 1
+    }))
+}
+
+#[cfg(test)]
+mod read_budget_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Answer one request with `sent`, then hold the connection open, silent.
+    fn stalled_after(sent: &'static [u8]) -> ContractError {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut head = [0u8; 4096];
+            let _ = stream.read(&mut head);
+            let _ = stream.write_all(sent);
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        let outcome = request(
+            Scheme::Http,
+            "127.0.0.1",
+            port,
+            "GET",
+            "/",
+            &[],
+            &[],
+            Duration::from_millis(200),
+        );
+        let _ = server.join();
+        match outcome {
+            Ok(response) => panic!("a stalled answer must fail, got status {}", response.status),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn a_stall_after_the_status_line_is_a_spent_read_budget() {
+        let sends: [&'static [u8]; 3] = [
+            b"HTTP/1.1 200 OK\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{}",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n",
+        ];
+        for sent in sends {
+            let error = stalled_after(sent);
+            assert_eq!(error.code, "COMPANY_UNREACHABLE");
+            assert_eq!(
+                error
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("timeout_observed")),
+                Some(&serde_json::Value::Bool(true)),
+                "{}",
+                String::from_utf8_lossy(sent)
+            );
+        }
+    }
 }
 
 #[cfg(test)]

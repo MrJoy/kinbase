@@ -487,8 +487,9 @@ fn resolve_as_of(
             }
         }
     };
-    // The verified authority snapshot is recorded proof of a later instant.
-    Ok(crate::repository::advance_as_of(launcher, &recorded))
+    // Omitted --as-of is the recorded proof clock (ruling R-1/C12). The
+    // projector and hook advance to the signed snapshot on their own.
+    Ok(recorded)
 }
 
 fn store_to_kind(store: Store) -> crate::StoreKind {

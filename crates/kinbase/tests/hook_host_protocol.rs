@@ -360,6 +360,83 @@ fn the_same_prompt_seen_again_adds_no_record() {
     assert_eq!(counts(), first, "{ledgers:?}");
 }
 
+#[test]
+fn the_transcript_copy_of_a_hook_prompt_is_the_same_message() {
+    // The hook captured the prompt and the transcript then named it again
+    // under the host's own id: each minted its own candidates and receipts,
+    // so a Stop returned both sets (V-9 parity).
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let text = "We decided to keep the retry budget at three attempts.";
+    let prompt = json!({
+        "session_id": "host-session-15",
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": text
+    });
+    assert!(
+        kinbase(
+            &world,
+            &["hooks", "dispatch", "claude", "UserPromptSubmit"],
+            &[],
+            prompt.to_string().as_bytes(),
+        )
+        .status
+        .success()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while fs::read_dir(pending_dir(&world))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // One observation, and with it one set of atoms and candidates.
+    let observations = || {
+        fs::read_to_string(world.personal.join("observations.jsonl"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    let before = observations();
+    assert_eq!(before, 1, "the prompt was observed");
+    // The transcript carries the prompt again and an assistant turn that
+    // echoes it word for word; the echo is a turn of its own.
+    let transcript = temp.path().join("transcript.jsonl");
+    let line = |id: &str, role: &str| {
+        json!({"id": id, "role": role, "text": text,
+               "observed_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+               "source_kind": "claude_jsonl"})
+        .to_string()
+    };
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n",
+            line("host-native-1", "user"),
+            line("host-native-2", "assistant")
+        ),
+    )
+    .expect("transcript");
+    let observed = ok(&kinbase(
+        &world,
+        &[
+            "session",
+            "observe",
+            "host-session-15",
+            "--event",
+            transcript.to_str().unwrap(),
+            "--json",
+        ],
+        &[],
+        b"",
+    ));
+    assert_eq!(observations(), before + 1, "{observed}");
+}
+
 fn pending_dir(world: &World) -> PathBuf {
     world.personal.join("pending-observations")
 }

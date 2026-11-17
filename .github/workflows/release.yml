@@ -67,7 +67,7 @@ jobs:
         with:
           pattern: kinbase-*
           merge-multiple: true
-      # wandercom releases are immutable once published, so the assets go onto a
+      # Releases here are immutable once published, so the assets go onto a
       # draft first. A re-run after a partial publish finds the draft and finishes it.
       - env:
           GH_TOKEN: ${{ github.token }}

@@ -543,6 +543,15 @@ pub fn observe(
             }
         }
     }
+    // A hook prompt's worker and an observe of the transcript can run at
+    // once; each must see the other's events before it picks an id, so the
+    // read below and the ledger appends are serialized.
+    // shortcut: one lock for every session's observes, held through
+    // classification; stripe it by session if live-classifier workers queue.
+    let store = crate::store::store_root(crate::StoreKind::Personal, &repo);
+    crate::paths::ensure_private_dir(&store, "physical store root")?;
+    let observe_lock = crate::paths::lock_file(&store.join(".observe.lock"), "observe lock")?;
+    adopt_seen_prompt_ids(session, &mut records);
     let mut observations = Vec::new();
     for record in &records {
         let event_id = record["id"].as_str().unwrap_or_default().to_owned();
@@ -588,6 +597,7 @@ pub fn observe(
                 "event_id": event_id,
                 "event_type": "observation",
                 "observed_at": observed_at,
+                "role": record["role"],
                 "text_digest": digest
             }),
         ));
@@ -777,6 +787,7 @@ pub fn observe(
     for candidate in &candidate_records {
         append_personal("candidates.jsonl", candidate)?;
     }
+    drop(observe_lock);
 
     let mut admissions = Vec::new();
     let mut questions = BTreeSet::new();
@@ -785,7 +796,15 @@ pub fn observe(
             questions.insert(question);
         }
     }
-    for candidate in &candidate_records {
+    // Company goes last: an apology is owed in every destination committed
+    // when the Company attempt fails, and a Codebase sibling admitted after
+    // that failure got none, so its deadline had no orphan to abandon.
+    let (company, local): (Vec<&Value>, Vec<&Value>) =
+        candidate_records.iter().partition(|candidate| {
+            crate::json::get_str(candidate, "destination")
+                .is_some_and(|destination| destination.starts_with("company"))
+        });
+    for candidate in local.into_iter().chain(company) {
         admissions.push(admit_candidate(&launcher, &repo, candidate)?);
     }
 
@@ -819,6 +838,58 @@ pub fn observe(
     });
     print_value(&result, json);
     Ok(())
+}
+
+/// An id `queue_hook_observation` derived for a host prompt.
+fn is_hook_prompt_id(id: &str) -> bool {
+    id.strip_prefix("prompt_")
+        .is_some_and(|rest| rest.len() == 24 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A host prompt and the transcript's copy of it are one message. The hook
+/// queues the prompt under an id derived from its text and the transcript
+/// names it again under the host's own id; each minted its own candidates
+/// and receipts, so a Stop returned both sets (V-9 parity). A record whose
+/// text this session already observed, where either side is a hook prompt,
+/// takes the id seen first, so its candidates and receipts are the same ones.
+/// Only user messages qualify on both sides: an assistant turn that echoes a
+/// prompt is a turn of its own, and adopting the prompt's id dropped it as a
+/// duplicate. A seen event without a recorded role is never adopted.
+fn adopt_seen_prompt_ids(session: &str, records: &mut [Map<String, Value>]) {
+    let canonical = crate::json::jcs_text(&Value::String(session.to_owned()));
+    let Ok(session_text) = serde_json::from_str::<String>(&canonical) else {
+        return;
+    };
+    let marker = format!("\"session_id\":{canonical}");
+    let seen = personal_records_tagged(
+        "session-events.jsonl",
+        "session_id",
+        &[session_text.as_str()],
+        |line| crate::store::bytes_contain(line, marker.as_bytes()),
+    );
+    for record in records.iter_mut() {
+        let (Some(id), Some(text), Some("user")) = (
+            record.get("id").and_then(Value::as_str),
+            record.get("text").and_then(Value::as_str),
+            record.get("role").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let digest = sha256_bytes(text.as_bytes());
+        let first = seen
+            .iter()
+            .filter(|event| {
+                crate::json::get_str(event, "session_id") == Some(session_text.as_str())
+                    && crate::json::get_str(event, "text_digest") == Some(digest.as_str())
+                    && crate::json::get_str(event, "role") == Some("user")
+            })
+            .filter_map(|event| crate::json::get_str(event, "event_id"))
+            .find(|seen_id| *seen_id != id && (is_hook_prompt_id(id) || is_hook_prompt_id(seen_id)))
+            .map(str::to_owned);
+        if let Some(first) = first {
+            record.insert("id".to_owned(), Value::String(first));
+        }
+    }
 }
 
 /// A host session token is caller-supplied and opaque.  Record it as active
@@ -2028,7 +2099,14 @@ pub fn checkpoint_internal(session: &str) -> Result<(Value, Option<ContractError
         let launcher = crate::launcher::Launcher::load();
         let latest = latest_receipts(&candidates.keys().map(String::as_str).collect());
         let mut decisions_synced = false;
-        for candidate in candidates.values() {
+        // Company last, as `observe` admits: a Codebase sibling committed
+        // after the Company attempt failed would be owed no apology.
+        let mut ordered: Vec<&Value> = candidates.values().collect();
+        ordered.sort_by_key(|candidate| {
+            crate::json::get_str(candidate, "destination")
+                .is_some_and(|destination| destination.starts_with("company"))
+        });
+        for candidate in ordered {
             let admitted = (|| {
                 let digest = candidate_digest(candidate)?;
                 let latest = latest.as_ref().map_err(Clone::clone)?;
@@ -2978,20 +3056,24 @@ fn reserve_nonce(
     payload_digest: &str,
     receipt_id: &str,
 ) -> Result<(Vec<u8>, Value), ContractError> {
-    let bound = journal
-        .read("nonce_reservation")
-        .and_then(|marker| crate::json::get_str(&marker, "event_canonical").map(str::to_owned));
-    let (canonical, event) = match bound {
-        Some(canonical) => {
-            let event = crate::json::parse_strict_value(canonical.as_bytes()).map_err(|error| {
-                ContractError::integrity(
-                    "DIGEST_MISMATCH",
-                    format!("journaled event bytes are not canonical: {error}"),
-                    "Preserve the journal; the bound event bytes are never reinterpreted.",
-                )
-            })?;
-            (canonical, event)
-        }
+    let bound = || -> Result<Option<(String, Value)>, ContractError> {
+        let Some(canonical) = journal
+            .read("nonce_reservation")
+            .and_then(|marker| crate::json::get_str(&marker, "event_canonical").map(str::to_owned))
+        else {
+            return Ok(None);
+        };
+        let event = crate::json::parse_strict_value(canonical.as_bytes()).map_err(|error| {
+            ContractError::integrity(
+                "DIGEST_MISMATCH",
+                format!("journaled event bytes are not canonical: {error}"),
+                "Preserve the journal; the bound event bytes are never reinterpreted.",
+            )
+        })?;
+        Ok(Some((canonical, event)))
+    };
+    let (mut canonical, mut event) = match bound()? {
+        Some(bound) => bound,
         None => {
             let event = build_destination_event(Some(launcher), store, repository_uuid, record)?;
             (crate::json::record_text(&event)?, event)
@@ -2999,6 +3081,17 @@ fn reserve_nonce(
     };
     if !journal.is_complete("nonce_reservation") {
         let _generation = repository.admission_lock(repository_uuid)?;
+        // Two concurrent retries both found no reservation and each built
+        // its own bytes (a different `asserted_at`); the second used to
+        // rebind the nonce to them and commit a second event. Bytes another
+        // process bound meanwhile win, whether it completed the reservation
+        // or crashed after beginning it.
+        if let Some(reserved) = bound()? {
+            (canonical, event) = reserved;
+        }
+        if journal.is_complete("nonce_reservation") {
+            return Ok((canonical.into_bytes(), event));
+        }
         journal.begin(
             "nonce_reservation",
             json!({

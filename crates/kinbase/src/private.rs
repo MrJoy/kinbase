@@ -265,10 +265,20 @@ impl PrivateStore {
             )
             .map_err(sqlite_error("quarantine schema"))?;
         if !has_identity {
+            // Two processes opening a fresh store both see no column; the
+            // second ALTER then failed "duplicate column name" and ended a
+            // concurrent checkpoint with RUN_INTEGRITY_FAILED. Losing that
+            // race is success: the column exists.
+            match self
+                .connection
+                .execute_batch("ALTER TABLE quarantine ADD COLUMN identity TEXT;")
+            {
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                added => added.map_err(sqlite_error("quarantine identity"))?,
+            }
             self.connection
                 .execute_batch(
-                    "ALTER TABLE quarantine ADD COLUMN identity TEXT;
-                     CREATE UNIQUE INDEX IF NOT EXISTS quarantine_identity ON quarantine(identity);",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS quarantine_identity ON quarantine(identity);",
                 )
                 .map_err(sqlite_error("quarantine identity"))?;
         }

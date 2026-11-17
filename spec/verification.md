@@ -492,8 +492,7 @@ cluster sizes and source dependence reported rather than manufactured.
 - Measure warm, cold, invalid-cache, and full-fsck-required SessionStart separately;
   run at least 200 invocations per host/state on the recorded proof machine, report
   CPU/RAM/filesystem, and require every state's p95 under two seconds. Company connect
-  budget is 250 ms, with a separate 250 ms resolution budget where the endpoint
-  names a host, cold/degraded projection is empty, and background full fsck at
+  budget is 250 ms, cold/degraded projection is empty, and background full fsck at
   the 10,000-event ceiling finishes within 120 seconds. Across the 20-session private
   soak, at least 90% of starts must take the warm verified path and deliver nonempty
   trusted context when eligible facts exist; after the first cold start, at most 5%
@@ -783,10 +782,8 @@ pass.
 - `fsck`, `doctor`, corpus status, question status, and experiment status are
   executable and useful after restart. `explain <logical-key>` shows each reducer
   admission/rejection step and the evidence needed to flip the result.
-- Kinbase HTTP rejects unauthenticated reads, Origin-bearing requests, and
-  non-JSON writes; all receive typed remediation-safe errors. A non-loopback Host
-  is rejected unless `allow_non_loopback` is set, which a managed deployment sets
-  because it is reached through a cluster Service name rather than a literal.
+- Kinbase HTTP rejects unauthenticated reads, non-loopback Host, Origin-bearing
+  requests, and non-JSON writes; all receive typed remediation-safe errors.
 - Static analysis, formatting, type checks, dependency audit, and full test suite run
   without undeclared network access.
 - [`leak-runbook.md`](leak-runbook.md) is exercised as a tabletop against one seeded

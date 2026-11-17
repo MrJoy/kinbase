@@ -479,7 +479,7 @@ startup failure even when path access remains denied.
 table, authority registry, source observations, current-view cache, Unknown queue,
 and monotonic change cursor. The proof runs service and client as separate processes.
 Every endpoint, including reads, requires a per-instance bearer token loaded from a
-mode-0600 file, loopback Host validation unless opted out, absent Origin header, and JSON content
+mode-0600 file, exact loopback Host validation, absent Origin header, and JSON content
 type for bodies. Tokens are capability-scoped (`facts:read`, `questions:write`,
 `directory:read`, or administrative issuance), compared in constant time, bound to a
 client-instance public key, rotated by the Company owner, and throttled by a serialized
@@ -497,24 +497,6 @@ prose. Authentication/authorization failures return the same bounded body and ty
 refusal. Host/Origin checks are anti-CSRF hardening only; the security claim against a
 local same-UID process rests on scoped token plus client-key request signature, not
 those headers.
-
-A deployment may set `allow_non_loopback`, which lifts the bind, Host and client
-endpoint rules together so the service can be reached through a cluster Service
-name. Doing so moves the peer set from the operator's own processes to everything
-the network permits, and the transport is cleartext: the endpoint parser accepts
-`http://` only, so TLS is unreachable rather than merely absent, and the bearer
-token crosses the network on every request. The signature does not narrow this.
-A request supplies its own client key, and while a token and key pair is recorded
-the first-use binding that would pin them is not yet enforced, so an observer of
-one request can mint a fresh key and sign for the same token. On a routable bind
-the token is therefore the whole credential.
-
-Isolation for such a deployment comes from the network, not from the service:
-ingress denied by default, and no workload admitted to the port that is not meant
-to read the store. That is an accepted risk of the managed shape rather than a
-property of the proof, and it is recorded here so it is not inherited silently. A
-transport option for operators wanting defence in depth, and enforcement of the
-first-use client-key binding, remain open.
 
 A client cache binds company ID, cursor, authority snapshot, separate short
 revocation-valid-until, fact-valid-until, and the root/signature chain. Both clocks
@@ -761,10 +743,8 @@ temporary homes by invoking installed hook commands and config, not by passing
 native envelope samples; `doctor` rejects unsupported ranges.
 
 SessionStart has a two-second p95 proof budget. It uses a previously verified cache
-and launches asynchronous Company refresh with a 250-millisecond connection budget
-and, where the endpoint names a host rather than a literal, a separate
-250-millisecond resolution budget ahead of it, so a refresh that must resolve is
-bounded at 500 milliseconds; a blackholed endpoint cannot hold the
+and launches asynchronous Company refresh with a 250-millisecond connection budget;
+a blackholed endpoint cannot hold the
 host open. Fail-closed means affected facts are withheld with a loud degraded/Unknown
 status, never that an ordinary editor session is prevented from starting.
 Warm, cold, cache-invalid, and full-fsck-required starts all return the hook response

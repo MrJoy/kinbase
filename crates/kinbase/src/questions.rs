@@ -85,10 +85,9 @@ fn find_question(question_id: &str) -> Result<Value, ContractError> {
         })
 }
 
-fn find_unknown(question_id: &str) -> Result<Value, ContractError> {
-    let repo = repo()?;
+fn find_unknown_in(repo: &Path, question_id: &str) -> Result<Value, ContractError> {
     for store in [crate::StoreKind::Company, crate::StoreKind::Codebase] {
-        if let Ok(records) = crate::store::read_records(store, &repo, "unknowns.jsonl") {
+        if let Ok(records) = crate::store::read_records(store, repo, "unknowns.jsonl") {
             if let Some(record) = records.into_iter().rev().find(|record| {
                 ["unknown_id", "fact_id", "event_id"]
                     .iter()
@@ -1091,12 +1090,22 @@ pub(crate) fn authority_fact_event(
     Ok(event)
 }
 
+/// The short form of a closing record's id used in the closure event id: the
+/// twelve characters after a seven-byte prefix (`answer_`), or the whole id
+/// when that range is not on character boundaries. A shrug's fact id has no
+/// such prefix, and byte slicing panicked on a short or multibyte one.
+fn closure_suffix(answer_id: &str) -> &str {
+    answer_id
+        .get(7..min(19, answer_id.len()))
+        .unwrap_or(answer_id)
+}
+
 fn close_unknown(repo: &Path, question: &Value, answer_id: &str) -> Result<String, ContractError> {
     let unknown_id = question
         .get("unknown_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let prior = find_unknown(unknown_id)?;
+    let prior = find_unknown_in(repo, unknown_id)?;
     let field = |key: &str, fallback: &str| {
         prior
             .get(key)
@@ -1148,10 +1157,7 @@ fn close_unknown(repo: &Path, question: &Value, answer_id: &str) -> Result<Strin
         &cursor,
     );
     unknown.fact_id = unknown_id.to_owned();
-    unknown.event_id = format!(
-        "{unknown_id}:closed:{}",
-        &answer_id[7..min(19, answer_id.len())]
-    );
+    unknown.event_id = format!("{unknown_id}:closed:{}", closure_suffix(answer_id));
     unknown.status = "closed".to_owned();
     unknown.closure_evidence = vec![answer_id.to_owned()];
     let (private_path, _) = crate::crypto::ensure_keypair(crate::StoreKind::Company, repo)?;
@@ -1167,6 +1173,66 @@ fn close_unknown(repo: &Path, question: &Value, answer_id: &str) -> Result<Strin
     };
     crate::store::append_record(store, repo, "unknowns.jsonl", &unknown.to_value())?;
     Ok(unknown.event_id.clone())
+}
+
+/// Close every still-open question whose key a current `shrug` rules; the
+/// Unknown's closure event names the shrug fact as its evidence. Already-closed questions are untouched,
+/// so repeated projections append nothing.
+///
+/// `shrugs` is keyed by (logical key, scope); a question matches on its key and
+/// the scope of the Unknown it asks about, so a shrug in one store or
+/// repository never closes a question raised about another.
+pub(crate) fn close_shrugged(
+    repo: &Path,
+    shrugs: &BTreeMap<(String, String), String>,
+) -> Result<(), ContractError> {
+    for question in latest_questions(repo).into_values() {
+        let field = |name: &str| {
+            question
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let Some(shrug_id) = shrugs.get(&(field("logical_key"), field("unknown_scope"))) else {
+            continue;
+        };
+        if !matches!(
+            question.get("status").and_then(Value::as_str),
+            Some("open" | "asked" | "awaiting_authority")
+        ) {
+            continue;
+        }
+        let closure_event_id = close_unknown(repo, &question, shrug_id)?;
+        let mut updated = question.clone();
+        if let Value::Object(values) = &mut updated {
+            values.insert("status".to_owned(), json!("closed"));
+            values.insert("closure_event_id".to_owned(), json!(closure_event_id));
+        }
+        append_company(repo, "questions.jsonl", &updated)?;
+    }
+    Ok(())
+}
+
+/// The decision an Unknown was first asked under, if any question asks about it.
+/// Whether `unknown_id` already has a question under exactly `decision`.
+pub(crate) fn asked_under(repo: &Path, unknown_id: &str, decision: &str) -> bool {
+    company_records_with_repo(repo, "questions.jsonl").iter().any(|record| {
+        record.get("unknown_id").and_then(Value::as_str) == Some(unknown_id)
+            && record.get("decision").and_then(Value::as_str) == Some(decision)
+    })
+}
+
+pub(crate) fn decision_asked_for(repo: &Path, unknown_id: &str) -> Option<String> {
+    company_records_with_repo(repo, "questions.jsonl")
+        .into_iter()
+        .find(|record| record.get("unknown_id").and_then(Value::as_str) == Some(unknown_id))
+        .and_then(|record| {
+            record
+                .get("decision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn status(question_id: &str, json: bool) -> Result<(), ContractError> {
@@ -1237,4 +1303,17 @@ fn io_error(error: std::io::Error) -> ContractError {
         false,
         ExitCode::InternalFailure,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::closure_suffix;
+
+    #[test]
+    fn a_short_or_multibyte_closing_id_does_not_panic() {
+        assert_eq!(closure_suffix("answer_0123456789abcdef"), "0123456789ab");
+        assert_eq!(closure_suffix("fact_1"), "fact_1");
+        // Byte 7 falls inside the first `é`.
+        assert_eq!(closure_suffix("fact_xéééééééé"), "fact_xéééééééé");
+    }
 }

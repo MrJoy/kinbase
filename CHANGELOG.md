@@ -4,14 +4,6 @@ Notable changes to Kinbase. Dates are UTC.
 
 ## Unreleased
 
-### Fixed
-
-- `hooks dispatch` no longer exits 4 (`CONFIG_INVARIANT`, "inherited
-  descriptor(s) outside the frozen allowlist") when the host leaks an open
-  descriptor into the hook. Startup attestation closes such descriptors for a
-  hook and names them on stderr; one under the Personal root still fails it.
-  Candidate spec amendment 004 records the change.
-
 ### Changed
 
 - A statement goes to the Company only when it claims organization-wide
@@ -21,6 +13,40 @@ Notable changes to Kinbase. Dates are UTC.
   organization word ("company policy", "the organization's roadmap").
   "The governance guard blocks the edit" and "incorporate" no longer route to
   the Company. (#43)
+- Omitting `--as-of` on `status`, `fsck`, `explain`, `corpus rebuild` and
+  `recall` uses the repository's recorded proof clock again
+  (`as_of_source=recorded-proof-clock`), not the cached authority snapshot's
+  `issued_at`. `project` and SessionStart still advance to the snapshot.
+- A git commit carrying an agent `Co-authored-by:` trailer is recorded as
+  `ai_generated` whoever its author is, so its standing stays capped; existing
+  repositories re-record such commits on their next ingest. Ingest output now
+  reports each observation's `provenance` and `standing`.
+- A contested key with no answering authority opens a question, and a later
+  shrug on that key closes it.
+- `session observe` admits a message's Personal and Codebase candidates
+  before its Company candidate, so a Company failure leaves an apology in every
+  destination that already committed.
+- Once a Company endpoint has used up its read budget, the rest of that
+  command fails further requests to it at once with `COMPANY_UNREACHABLE`;
+  they stay pending and a later run retries them.
+
+### Fixed
+
+- `hooks dispatch` no longer exits 4 (`CONFIG_INVARIANT`, "inherited
+  descriptor(s) outside the frozen allowlist") when the host leaks an open
+  descriptor into the hook. Startup attestation closes such descriptors for a
+  hook and names them on stderr; one under the Personal root still fails it.
+  Candidate spec amendment 004 records the change.
+- A malformed kinbase config at `.kin/config` (one naming `kinbase-repo/`)
+  refuses with exit 5 instead of being skipped as Kindex's file.
+- GitHub exports are ordered by one clock: when any export has no date of its
+  own, all are ordered by file modification time.
+- Two concurrent checkpoints no longer fail on adding the quarantine identity
+  column, and concurrent retries of one admission commit one event.
+- A prompt the `UserPromptSubmit` hook captured and the transcript's copy of
+  the same message are one message: the transcript copy takes the hook's id,
+  so it mints no second set of candidates and receipts, and a Stop returns
+  each receipt once.
 
 ## 0.1.2 - 2026-10-30
 

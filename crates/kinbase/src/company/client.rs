@@ -13,6 +13,11 @@ use std::time::Duration;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// `host:port` of each Company endpoint that ran out a read budget in this
+/// process.
+static UNANSWERED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+    std::sync::OnceLock::new();
+
 /// A snapshot is a reduction over the whole Company event log, so it costs
 /// what the log costs: 2.5 s against one deployment's 2,720 events and rising.
 /// At 1,500 ms -- a bound sized for proof fixtures -- every repository in the
@@ -163,9 +168,21 @@ impl Client {
         if self.oidc.is_some() || self.gateway_key.is_some() {
             headers.insert(1, ("X-Kinbase-Token".to_owned(), self.token.token.clone()));
         }
+        // An endpoint that let one request run out its read budget is not
+        // asked again by this process: an observation fanning out 44 Company
+        // candidates to a silent endpoint waited 20 s for each, 15 minutes in
+        // all, and every later attempt is retried by a later pass anyway.
+        let endpoint = format!("{}:{}", self.host, self.port);
+        let silent = UNANSWERED.get_or_init(Default::default);
+        if silent.lock().is_ok_and(|silent| silent.contains(&endpoint)) {
+            return Err(ContractError::unreachable(
+                "Company endpoint did not answer within the read budget earlier in this process; not asked again",
+            )
+            .with_detail(json!({"timeout_observed": true, "omitted_count": 1})));
+        }
         self.bytes_sent
             .set(self.bytes_sent.get() + body_bytes.len() as u64 + 256);
-        http::request(
+        let response = http::request(
             self.scheme,
             &self.host,
             self.port,
@@ -174,7 +191,18 @@ impl Client {
             &headers,
             &body_bytes,
             read_timeout,
-        )
+        );
+        if let Err(error) = &response
+            && error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("timeout_observed"))
+                == Some(&Value::Bool(true))
+            && let Ok(mut silent) = silent.lock()
+        {
+            silent.insert(endpoint);
+        }
+        response
     }
 
     pub fn get(&self, path: &str) -> Result<Response, ContractError> {

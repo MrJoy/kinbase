@@ -431,8 +431,18 @@ fn wait_for_observation(personal: &Path, identity: &str) -> Value {
 }
 
 fn dispatch(world: &HostWorld, event: &str, stdin: &[u8], json: bool) -> std::process::Output {
+    dispatch_host(world, "claude", event, stdin, json)
+}
+
+fn dispatch_host(
+    world: &HostWorld,
+    host: &str,
+    event: &str,
+    stdin: &[u8],
+    json: bool,
+) -> std::process::Output {
     use std::io::Write as _;
-    let mut args = vec!["hooks", "dispatch", "claude", event];
+    let mut args = vec!["hooks", "dispatch", host, event];
     if json {
         args.push("--json");
     }
@@ -455,6 +465,35 @@ fn dispatch(world: &HostWorld, event: &str, stdin: &[u8], json: bool) -> std::pr
         .write_all(stdin)
         .expect("write stdin");
     child.wait_with_output().expect("dispatch output")
+}
+
+#[test]
+fn native_codex_stop_is_silent_and_json_mode_keeps_the_checkpoint_receipt() {
+    let temp = TempDir::new().expect("tempdir");
+    let world = host_world(&temp);
+    let stop = json!({
+        "session_id": "codex-stop-session",
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "Stop",
+        "stop_hook_active": false
+    })
+    .to_string();
+
+    // Codex parses nonempty Stop stdout as one JSON object. A frame such
+    // as 12\n{"facts":[]} is rejected as trailing data after the length.
+    let native = dispatch_host(&world, "codex", "Stop", stop.as_bytes(), false);
+    assert!(native.status.success(), "{native:?}");
+    assert!(
+        native.stdout.is_empty(),
+        "unexpected Stop stdout: {native:?}"
+    );
+
+    let diagnostic = dispatch_host(&world, "codex", "Stop", stop.as_bytes(), true);
+    assert!(diagnostic.status.success(), "{diagnostic:?}");
+    let receipt: Value = serde_json::from_slice(&diagnostic.stdout).expect("Stop receipt");
+    assert_eq!(receipt["checkpointed"], true, "{receipt}");
+    assert_eq!(receipt["session_id"], "codex-stop-session");
+    assert!(receipt["envelope"].is_string(), "{receipt}");
 }
 
 #[test]
@@ -771,7 +810,7 @@ fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_kinbase"))
         .current_dir(&outside)
-        .args(["hooks", "dispatch", "claude", "Stop"])
+        .args(["hooks", "dispatch", "codex", "Stop"])
         .env("HOME", &world.home)
         .env("XDG_CONFIG_HOME", &world.config_home)
         .env("XDG_STATE_HOME", world.home.join(".state"))
@@ -789,7 +828,8 @@ fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
         .expect("write");
     let output = child.wait_with_output().expect("output");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_ne!(output.status.code(), Some(2), "{stderr}");
+    assert!(output.status.success(), "{stderr}");
+    assert!(output.stdout.is_empty(), "unexpected Stop stdout: {output:?}");
     assert!(
         !stderr.contains("REPO_UNCERTIFIED"),
         "an unplaceable candidate is not a refusal to report: {stderr}"

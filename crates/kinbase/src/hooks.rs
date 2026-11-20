@@ -1,9 +1,8 @@
 //! Host integration: plan, install, and dispatch native hooks.
 //!
 //! Hook configuration is user-level only. Plan is side-effect free, install is
-//! additive, and dispatch always consumes native stdin before emitting either
-//! the JSON receipt (including the base64 envelope) or the length-prefixed
-//! stream used by the non-JSON host mode.
+//! additive, and dispatch consumes native stdin before returning the host's
+//! response or an explicit JSON receipt (including the base64 envelope).
 
 use crate::error::{ContractError, ExitCode};
 use crate::repository::RepoContext;
@@ -935,6 +934,11 @@ fn dispatch_event(
             admission_failure = failure;
         }
         _ => {}
+    }
+    if !json && host == "codex" && event_type == "Stop" {
+        // Codex parses nonempty successful Stop stdout as one hook response.
+        // The checkpoint is already done and has no host decision to return.
+        return admission_failure.map_or(Ok(()), Err);
     }
     // The envelope carries the context the response names, each fact body
     // base64 encoded (architecture §9); it used to be a constant empty body.

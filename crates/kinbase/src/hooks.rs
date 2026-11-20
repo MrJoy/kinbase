@@ -935,9 +935,9 @@ fn dispatch_event(
         }
         _ => {}
     }
-    if !json && host == "codex" && event_type == "Stop" {
-        // Codex parses nonempty successful Stop stdout as one hook response.
-        // The checkpoint is already done and has no host decision to return.
+    if !json && event_type == "Stop" {
+        // Native Stop handlers have no decision to return after checkpointing.
+        // The length-prefixed evidence frame is not a native hook response.
         return admission_failure.map_or(Ok(()), Err);
     }
     // The envelope carries the context the response names, each fact body

@@ -469,30 +469,39 @@ fn dispatch_host(
 
 #[test]
 fn native_codex_stop_is_silent_and_json_mode_keeps_the_checkpoint_receipt() {
+    assert_native_stop_output("codex");
+}
+
+#[test]
+fn native_claude_stop_is_silent_and_json_mode_keeps_the_checkpoint_receipt() {
+    assert_native_stop_output("claude");
+}
+
+fn assert_native_stop_output(host: &str) {
     let temp = TempDir::new().expect("tempdir");
     let world = host_world(&temp);
     let stop = json!({
-        "session_id": "codex-stop-session",
+        "session_id": "native-stop-session",
         "cwd": world.repo.display().to_string(),
         "hook_event_name": "Stop",
         "stop_hook_active": false
     })
     .to_string();
 
-    // Codex parses nonempty Stop stdout as one JSON object. A frame such
-    // as 12\n{"facts":[]} is rejected as trailing data after the length.
-    let native = dispatch_host(&world, "codex", "Stop", stop.as_bytes(), false);
+    // Native Stop has no hook decision to emit. A length-prefixed evidence
+    // frame such as 12\n{"facts":[]} is not a native hook response.
+    let native = dispatch_host(&world, host, "Stop", stop.as_bytes(), false);
     assert!(native.status.success(), "{native:?}");
     assert!(
         native.stdout.is_empty(),
         "unexpected Stop stdout: {native:?}"
     );
 
-    let diagnostic = dispatch_host(&world, "codex", "Stop", stop.as_bytes(), true);
+    let diagnostic = dispatch_host(&world, host, "Stop", stop.as_bytes(), true);
     assert!(diagnostic.status.success(), "{diagnostic:?}");
     let receipt: Value = serde_json::from_slice(&diagnostic.stdout).expect("Stop receipt");
     assert_eq!(receipt["checkpointed"], true, "{receipt}");
-    assert_eq!(receipt["session_id"], "codex-stop-session");
+    assert_eq!(receipt["session_id"], "native-stop-session");
     assert!(receipt["envelope"].is_string(), "{receipt}");
 }
 
@@ -654,17 +663,15 @@ fn append_jsonl_refuses_a_record_that_is_not_canonical() {
 fn dispatch_refuses_a_malformed_envelope_and_says_so_on_stderr() {
     let temp = TempDir::new().expect("tempdir");
     let world = host_world(&temp);
-    let output = dispatch(&world, "Stop", b"not json at all", false);
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "a malformed envelope is still refused"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("UNSUPPORTED_HOST_VERSION"),
-        "the host surfaces stderr, so the reason must be there: {stderr:?}"
-    );
+    for host in ["codex", "claude"] {
+        let output = dispatch_host(&world, host, "Stop", b"not json at all", false);
+        assert_eq!(output.status.code(), Some(3), "{host}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("UNSUPPORTED_HOST_VERSION"),
+            "{host}: {stderr:?}"
+        );
+    }
     assert!(
         !world.personal.join("session-checkpoints.jsonl").exists(),
         "nothing is checkpointed from a refused envelope"
@@ -781,16 +788,26 @@ fn checkpoint_streams_only_this_sessions_records_from_shared_ledgers() {
 
 #[test]
 fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
-    use std::io::Write as _;
+    for host in ["codex", "claude"] {
+        assert_held_admission_on_native_stop(host);
+    }
+
+    // The same refusal from an ordinary command still exits 2.
+    let refused = kinbase::error::ContractError::user_action("REPO_UNCERTIFIED", "m", "r");
+    assert_eq!(refused.exit(), 2);
+    assert_eq!(refused.for_host_hook().exit(), 3);
+}
+
+fn assert_held_admission_on_native_stop(host: &str) {
     // A session outside any Git worktree that has an automatic candidate for
     // a shared destination: this host has nowhere to put it. That is held,
     // not failed — the candidate waits for a later checkpoint and the hook
     // stays quiet. Exit 2 would tell the host to refuse to stop and fire Stop
     // again, so it is never used.
     let temp = TempDir::new().expect("tempdir");
-    let world = host_world(&temp);
-    let outside = temp.path().join("not-a-repository");
-    fs::create_dir_all(&outside).expect("outside dir");
+    let mut world = host_world(&temp);
+    world.repo = temp.path().join("not-a-repository");
+    fs::create_dir_all(&world.repo).expect("outside dir");
     let canonical = "x";
     let candidate = json!({
         "admission_mode": "automatic",
@@ -804,32 +821,14 @@ fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
         .expect("candidate");
     let stop = json!({
         "session_id": "host-session-4",
-        "cwd": outside.display().to_string(),
+        "cwd": world.repo.display().to_string(),
         "hook_event_name": "Stop",
         "stop_hook_active": false
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kinbase"))
-        .current_dir(&outside)
-        .args(["hooks", "dispatch", "codex", "Stop"])
-        .env("HOME", &world.home)
-        .env("XDG_CONFIG_HOME", &world.config_home)
-        .env("XDG_STATE_HOME", world.home.join(".state"))
-        .env_remove("KINBASE_COMPANY_URL")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn_alone()
-        .expect("spawn");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(stop.to_string().as_bytes())
-        .expect("write");
-    let output = child.wait_with_output().expect("output");
+    let output = dispatch_host(&world, host, "Stop", stop.to_string().as_bytes(), false);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
-    assert!(output.stdout.is_empty(), "unexpected Stop stdout: {output:?}");
+    assert!(output.status.success(), "{host}: {stderr}");
+    assert!(output.stdout.is_empty(), "{host}: {output:?}");
     assert!(
         !stderr.contains("REPO_UNCERTIFIED"),
         "an unplaceable candidate is not a refusal to report: {stderr}"
@@ -847,11 +846,6 @@ fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
         checkpoints.contains("\"candidate_id\":\"cand_probe\""),
         "{checkpoints}"
     );
-
-    // The same refusal from an ordinary command still exits 2.
-    let refused = kinbase::error::ContractError::user_action("REPO_UNCERTIFIED", "m", "r");
-    assert_eq!(refused.exit(), 2);
-    assert_eq!(refused.for_host_hook().exit(), 3);
 }
 
 #[test]

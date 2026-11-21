@@ -468,44 +468,6 @@ fn dispatch_host(
 }
 
 #[test]
-fn native_codex_stop_is_silent_and_json_mode_keeps_the_checkpoint_receipt() {
-    assert_native_stop_output("codex");
-}
-
-#[test]
-fn native_claude_stop_is_silent_and_json_mode_keeps_the_checkpoint_receipt() {
-    assert_native_stop_output("claude");
-}
-
-fn assert_native_stop_output(host: &str) {
-    let temp = TempDir::new().expect("tempdir");
-    let world = host_world(&temp);
-    let stop = json!({
-        "session_id": "native-stop-session",
-        "cwd": world.repo.display().to_string(),
-        "hook_event_name": "Stop",
-        "stop_hook_active": false
-    })
-    .to_string();
-
-    // Native Stop has no hook decision to emit. A length-prefixed evidence
-    // frame such as 12\n{"facts":[]} is not a native hook response.
-    let native = dispatch_host(&world, host, "Stop", stop.as_bytes(), false);
-    assert!(native.status.success(), "{native:?}");
-    assert!(
-        native.stdout.is_empty(),
-        "unexpected Stop stdout: {native:?}"
-    );
-
-    let diagnostic = dispatch_host(&world, host, "Stop", stop.as_bytes(), true);
-    assert!(diagnostic.status.success(), "{diagnostic:?}");
-    let receipt: Value = serde_json::from_slice(&diagnostic.stdout).expect("Stop receipt");
-    assert_eq!(receipt["checkpointed"], true, "{receipt}");
-    assert_eq!(receipt["session_id"], "native-stop-session");
-    assert!(receipt["envelope"].is_string(), "{receipt}");
-}
-
-#[test]
 fn dispatch_accepts_host_envelopes_with_control_characters_and_floats() {
     let temp = TempDir::new().expect("tempdir");
     let world = host_world(&temp);
@@ -875,6 +837,13 @@ fn assert_held_admission_on_native_stop(host: &str) {
         checkpoints.contains("\"candidate_id\":\"cand_probe\""),
         "{checkpoints}"
     );
+
+    let output = dispatch_host(&world, host, "Stop", stop.to_string().as_bytes(), true);
+    assert!(output.status.success(), "{host}: {output:?}");
+    let receipt: Value = serde_json::from_slice(&output.stdout).expect("Stop receipt");
+    assert_eq!(receipt["checkpointed"], true, "{host}: {receipt}");
+    assert_eq!(receipt["session_id"], "host-session-4");
+    assert!(receipt["envelope"].is_string(), "{host}: {receipt}");
 }
 
 #[test]

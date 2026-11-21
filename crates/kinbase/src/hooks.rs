@@ -25,6 +25,7 @@ pub fn dispatch(
     json: bool,
 ) -> Result<(), ContractError> {
     let hosted = matches!(command, crate::command_types::HookCommand::Dispatch { .. });
+    let stop_dispatch = command.is_stop_dispatch();
     let result = run(command, json);
     let result = if hosted {
         result.map_err(ContractError::for_host_hook)
@@ -33,10 +34,11 @@ pub fn dispatch(
     };
     // The host shows a failed hook's stderr and hides its stdout; a refusal
     // whose reason lived only on stdout surfaced as "No stderr output". This
-    // covers a failed launcher load as well as a refused envelope. In JSON
-    // mode the top-level boundary already mirrors the document.
+    // covers a refusal inside dispatch. The CLI owns Stop diagnostics, including
+    // failures before dispatch, and mirrors explicit JSON errors on stderr.
     if hosted
         && !json
+        && !stop_dispatch
         && let Err(error) = &result
     {
         eprintln!("{}: {}", error.code, error.message);

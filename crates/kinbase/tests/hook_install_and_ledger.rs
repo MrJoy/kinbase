@@ -666,16 +666,45 @@ fn dispatch_refuses_a_malformed_envelope_and_says_so_on_stderr() {
     for host in ["codex", "claude"] {
         let output = dispatch_host(&world, host, "Stop", b"not json at all", false);
         assert_eq!(output.status.code(), Some(3), "{host}: {output:?}");
+        assert!(output.stdout.is_empty(), "{host}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("UNSUPPORTED_HOST_VERSION"),
             "{host}: {stderr:?}"
+        );
+        assert!(stderr.contains("retryable:"), "{host}: {stderr:?}");
+        assert!(stderr.contains("evidence_id:"), "{host}: {stderr:?}");
+
+        let diagnostic = dispatch_host(&world, host, "Stop", b"not json at all", true);
+        assert_eq!(diagnostic.status.code(), Some(3), "{host}: {diagnostic:?}");
+        let document: Value = serde_json::from_slice(&diagnostic.stdout).expect("Stop error JSON");
+        assert_eq!(
+            document["error"]["code"],
+            "UNSUPPORTED_HOST_VERSION",
+            "{host}: {document}"
         );
     }
     assert!(
         !world.personal.join("session-checkpoints.jsonl").exists(),
         "nothing is checkpointed from a refused envelope"
     );
+}
+
+#[test]
+fn native_stop_reports_launcher_refusal_only_on_stderr() {
+    let temp = TempDir::new().expect("tempdir");
+    let world = host_world(&temp);
+    let config = world.config_home.join("kinbase/config.toml");
+    fs::set_permissions(config, fs::Permissions::from_mode(0o644)).expect("broaden config mode");
+
+    for host in ["codex", "claude"] {
+        let output = dispatch_host(&world, host, "Stop", b"{}", false);
+        assert_eq!(output.status.code(), Some(4), "{host}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("user config"), "{host}: {stderr:?}");
+        assert!(stderr.contains("remediation:"), "{host}: {stderr:?}");
+        assert!(output.stdout.is_empty(), "{host}: {output:?}");
+    }
 }
 
 #[test]

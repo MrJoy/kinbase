@@ -67,7 +67,21 @@ fn world(temp: &TempDir) -> World {
 }
 
 fn kinbase(world: &World, args: &[&str], envs: &[(&str, &Path)], stdin: &[u8]) -> Output {
+    kinbase_inheriting(world, args, envs, stdin, None)
+}
+
+/// [`kinbase`], with `inherit` open as descriptor 9 in the child, the way a
+/// host leaks one into its hook.
+fn kinbase_inheriting(
+    world: &World,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+    stdin: &[u8],
+    inherit: Option<&Path>,
+) -> Output {
     use std::io::Write as _;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
     let path = format!(
         "{}:{}",
         world.bin.display(),
@@ -89,6 +103,25 @@ fn kinbase(world: &World, args: &[&str], envs: &[(&str, &Path)], stdin: &[u8]) -
         .stderr(Stdio::piped());
     for (key, value) in envs {
         command.env(key, value);
+    }
+    let leaked = inherit.map(|path| fs::File::open(path).expect("open leaked descriptor"));
+    if let Some(source) = leaked.as_ref().map(AsRawFd::as_raw_fd) {
+        // SAFETY: dup2 and fcntl are async-signal-safe. Descriptor 9 ends up
+        // without close-on-exec, so the child inherits it; when the file
+        // already is 9, dup2 is a no-op and the flag is cleared directly.
+        unsafe {
+            command.pre_exec(move || {
+                let result = if source == 9 {
+                    libc::fcntl(9, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(source, 9)
+                };
+                if result < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = command.spawn_alone().expect("spawn kinbase");
     child
@@ -325,6 +358,83 @@ fn the_same_prompt_seen_again_adds_no_record() {
     std::thread::sleep(std::time::Duration::from_millis(5));
     submit();
     assert_eq!(counts(), first, "{ledgers:?}");
+}
+
+#[test]
+fn the_transcript_copy_of_a_hook_prompt_is_the_same_message() {
+    // The hook captured the prompt and the transcript then named it again
+    // under the host's own id: each minted its own candidates and receipts,
+    // so a Stop returned both sets (V-9 parity).
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let text = "We decided to keep the retry budget at three attempts.";
+    let prompt = json!({
+        "session_id": "host-session-15",
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": text
+    });
+    assert!(
+        kinbase(
+            &world,
+            &["hooks", "dispatch", "claude", "UserPromptSubmit"],
+            &[],
+            prompt.to_string().as_bytes(),
+        )
+        .status
+        .success()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while fs::read_dir(pending_dir(&world))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // One observation, and with it one set of atoms and candidates.
+    let observations = || {
+        fs::read_to_string(world.personal.join("observations.jsonl"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    let before = observations();
+    assert_eq!(before, 1, "the prompt was observed");
+    // The transcript carries the prompt again and an assistant turn that
+    // echoes it word for word; the echo is a turn of its own.
+    let transcript = temp.path().join("transcript.jsonl");
+    let line = |id: &str, role: &str| {
+        json!({"id": id, "role": role, "text": text,
+               "observed_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+               "source_kind": "claude_jsonl"})
+        .to_string()
+    };
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n",
+            line("host-native-1", "user"),
+            line("host-native-2", "assistant")
+        ),
+    )
+    .expect("transcript");
+    let observed = ok(&kinbase(
+        &world,
+        &[
+            "session",
+            "observe",
+            "host-session-15",
+            "--event",
+            transcript.to_str().unwrap(),
+            "--json",
+        ],
+        &[],
+        b"",
+    ));
+    assert_eq!(observations(), before + 1, "{observed}");
 }
 
 fn pending_dir(world: &World) -> PathBuf {
@@ -713,4 +823,58 @@ fn a_precompact_checkpoints_the_session_and_allows_the_compaction() {
     // already hold, so it is not recorded.
     assert_eq!(receipt["checkpoint_recorded"], false, "{receipt}");
     assert!(!world.personal.join("session-checkpoints.jsonl").exists());
+}
+
+/// A Codex PreToolUse dispatch with `inherit` leaked into it.
+fn dispatch_with_inherited(world: &World, inherit: &Path) -> Output {
+    let envelope = json!({
+        "session_id": "host-session-leak",
+        "cwd": world.repo.display().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {}
+    });
+    kinbase_inheriting(
+        world,
+        &["hooks", "dispatch", "codex", "PreToolUse"],
+        &[],
+        envelope.to_string().as_bytes(),
+        Some(inherit),
+    )
+}
+
+#[test]
+fn a_descriptor_the_host_leaked_does_not_fail_the_hook() {
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let stray = temp.path().join("host-pipe-stand-in");
+    fs::write(&stray, b"").expect("stray file");
+    let output = dispatch_with_inherited(&world, &stray);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(r#"{"kinbase":"closed_inherited_descriptors","descriptors":[9]}"#),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "exit {:?}: {} {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn a_leaked_personal_descriptor_still_fails_the_hook() {
+    let temp = TempDir::new().expect("tempdir");
+    let world = world(&temp);
+    let output = dispatch_with_inherited(&world, &world.personal);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Personal root"));
 }

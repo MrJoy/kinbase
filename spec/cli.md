@@ -47,8 +47,7 @@ without `.kin/` starts with no Codebase facts and offers `kinbase repo init`;
 ordinary coding remains available.
 
 Service config is an explicit `kinbased.toml` (0600) naming Company ID, SQLite
-path, bind address (loopback unless `allow_non_loopback` is set), bearer-token
-file, root key file,
+path, bind address (loopback only in the PoC), bearer-token file, root key file,
 retention, freshness, and rate ceilings. Malformed or unsafe config fails startup.
 
 ```toml

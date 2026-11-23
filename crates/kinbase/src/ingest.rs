@@ -1200,6 +1200,8 @@ pub fn observation_result(
         "repository_id": observation.repository_id,
         "revision": observation.revision,
         "branch": observation.branch,
+        "provenance": observation.provenance,
+        "standing": crate::model::observation_standing(observation.atom_kind.as_deref(), &observation.provenance),
         "disposition": disposition,
         "state": state,
         "observation_state": state,

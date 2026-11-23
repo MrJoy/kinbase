@@ -146,6 +146,29 @@ pub fn dir_identity(path: &Path) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
+/// Set when a host (Codex, Claude Code), not kinbase, launched this process
+/// as a hook: [`attest_descriptors`] then closes stray inherited descriptors
+/// instead of refusing, since kinbase cannot constrain what the host passes
+/// (`spec/amendment-004-host-launched-hook-descriptors.md`).
+static HOST_LAUNCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as host-launched; call before the first launcher load.
+pub fn mark_host_launched() {
+    HOST_LAUNCHED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `descriptor` is the Personal root or resolves under it.
+fn under_personal(
+    descriptor: &OpenDescriptor,
+    identity: Option<(u64, u64)>,
+    canonical: Option<&Path>,
+) -> bool {
+    identity.is_some_and(|(dev, ino)| descriptor.dev == dev && descriptor.ino == ino)
+        || canonical
+            .zip(descriptor.path.as_ref())
+            .is_some_and(|(root, path)| path.starts_with(root))
+}
+
 /// Startup attestation: refuse any inherited descriptor under the Personal
 /// root (by device/inode or resolved path) and any descriptor outside the
 /// frozen allowlist. Returns the attestation record for `doctor`.
@@ -156,11 +179,7 @@ pub fn attest_descriptors(personal_root: Option<&Path>) -> Result<Value, Contrac
     let personal_canonical = personal_root.and_then(|root| root.canonicalize().ok());
     let mut extra = Vec::new();
     for descriptor in &descriptors {
-        let under_personal = personal_identity
-            .is_some_and(|(dev, ino)| descriptor.dev == dev && descriptor.ino == ino)
-            || (personal_canonical.as_ref().zip(descriptor.path.as_ref()))
-                .is_some_and(|(root, path)| path.starts_with(root));
-        if under_personal {
+        if under_personal(descriptor, personal_identity, personal_canonical.as_deref()) {
             return Err(ContractError::refused(
                 "CONFIG_INVARIANT",
                 format!("inherited descriptor {} resolves under the Personal root; shared work refused before any side effect", descriptor.fd),
@@ -171,6 +190,26 @@ pub fn attest_descriptors(personal_root: Option<&Path>) -> Result<Value, Contrac
         if !allow.contains(&descriptor.fd) {
             extra.push(descriptor.fd);
         }
+    }
+    if !extra.is_empty() && HOST_LAUNCHED.load(std::sync::atomic::Ordering::Relaxed) {
+        // No Personal descriptor is present (checked above). Closing the rest
+        // means shared work never holds them; say which, without paths.
+        for fd in &extra {
+            // SAFETY: attestation runs before this process wraps any
+            // descriptor in an owned handle, so nothing else refers to it.
+            unsafe { libc::close(*fd) };
+        }
+        eprintln!(
+            "{}",
+            json!({"kinbase": "closed_inherited_descriptors", "descriptors": extra})
+        );
+        return Ok(json!({
+            "allowlist": allow,
+            "open_descriptors": descriptors.iter().map(|d| d.fd).filter(|fd| !extra.contains(fd)).collect::<Vec<_>>(),
+            "closed_host_descriptors": extra,
+            "personal_descriptor_present": false,
+            "facility": if cfg!(target_os = "macos") { "fcntl(F_GETFD)+fstat+F_GETPATH" } else { "fcntl(F_GETFD)+fstat+/proc/self/fd" }
+        }));
     }
     if !extra.is_empty() {
         return Err(ContractError::refused(

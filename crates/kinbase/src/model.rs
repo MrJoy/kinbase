@@ -209,6 +209,17 @@ pub fn effective_standing(standing: &str, provenance: &str) -> String {
     }
 }
 
+/// The standing an ingested observation is admitted at: `present`, except a
+/// direction-bearing kind, and always clamped by provenance. Ingest reports it
+/// and corpus admission signs it, so the two cannot disagree.
+pub fn observation_standing(atom_kind: Option<&str>, provenance: &str) -> String {
+    let claimed = match atom_kind {
+        Some("north_star") | Some("invariant") | Some("directional") => "ratified",
+        _ => "present",
+    };
+    effective_standing(claimed, provenance)
+}
+
 pub fn default_standing_pub() -> String {
     default_standing()
 }

@@ -28,21 +28,25 @@ pub fn parse_or_exit() -> Cli {
             let args: Vec<String> = std::env::args().skip(1).collect();
             let json = args.iter().any(|arg| arg == "--json");
             let contract_error = usage_error(&args, error.to_string());
-            print_error(json, &contract_error);
+            let native_stop = args.starts_with(&["hooks".into(), "dispatch".into()])
+                && matches!(args.get(2).map(String::as_str), Some("codex" | "claude"))
+                && args.get(3).is_some_and(|event| event == "Stop");
+            print_error(json, &contract_error, native_stop);
             std::process::exit(contract_error.exit());
         }
     }
 }
 
 pub fn run(json: bool, command: Command) {
-    let result = dispatch(json, command);
+    let mut native_stop = !json && matches!(&command, Command::Hooks(hook) if hook.is_stop_dispatch());
+    let result = dispatch(json, command, &mut native_stop);
     if let Err(error) = result {
-        print_error(json, &error);
+        print_error(json, &error, native_stop);
         std::process::exit(error.exit());
     }
 }
 
-fn print_error(json: bool, error: &ContractError) {
+fn print_error(json: bool, error: &ContractError, native_stop: bool) {
     if json {
         let document = error
             .output_document
@@ -56,10 +60,15 @@ fn print_error(json: bool, error: &ContractError) {
         println!("{}", line);
         eprintln!("{}", line);
     } else {
-        println!("{}: {}", error.code, error.message);
-        println!("remediation: {}", error.remediation);
-        println!("retryable: {}", error.retryable);
-        println!("evidence_id: {}", error.evidence_id);
+        let message = format!(
+            "{}: {}\nremediation: {}\nretryable: {}\nevidence_id: {}",
+            error.code, error.message, error.remediation, error.retryable, error.evidence_id
+        );
+        if native_stop {
+            eprintln!("{message}");
+        } else {
+            println!("{message}");
+        }
     }
 }
 
@@ -68,7 +77,7 @@ fn usage_error(_args: &[String], _detail: String) -> ContractError {
     ContractError::invariant("malformed command line; no state was changed")
 }
 
-fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
+fn dispatch(json: bool, command: Command, native_stop: &mut bool) -> Result<(), ContractError> {
     // Hook dispatch learns its repository from the host envelope on stdin;
     // loading the launcher here would select (and read the credentials of)
     // whatever Company the process cwd resolves to first. `hooks` loads its
@@ -77,7 +86,13 @@ fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
     // access and fail on credentials the service never uses. They keep the
     // launcher's descriptor attestation.
     let command = match command {
-        Command::Hooks(command) => return crate::hooks::dispatch(command, json),
+        Command::Hooks(command) => {
+            if matches!(command, HookCommand::Dispatch { .. }) {
+                // The host launched this process and may have leaked descriptors.
+                crate::sandbox::mark_host_launched();
+            }
+            return crate::hooks::dispatch(command, json, native_stop).map_err(internal);
+        }
         Command::Company(command) => {
             let personal_root =
                 crate::config::load_user_config()?.map(|user| user.personal.data_root);
@@ -614,8 +629,9 @@ fn resolve_as_of(
             }
         }
     };
-    // The verified authority snapshot is recorded proof of a later instant.
-    Ok(crate::repository::advance_as_of(launcher, &recorded))
+    // Omitted --as-of is the recorded proof clock (ruling R-1/C12). The
+    // projector and hook advance to the signed snapshot on their own.
+    Ok(recorded)
 }
 
 fn store_to_kind(store: Store) -> crate::StoreKind {

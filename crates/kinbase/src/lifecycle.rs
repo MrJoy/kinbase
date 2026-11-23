@@ -1942,26 +1942,23 @@ const BOT_MARKERS: [&str; 5] = [
 /// wrote it -- most tools leave no marker at all, so any existing repository's
 /// history is largely unrecoverable. Claiming those commits as deliberate human
 /// direction would manufacture exactly the signal this field exists to protect.
-fn commit_provenance(author: &str, email: &str, trailers: &str, subject: &str) -> String {
+fn commit_provenance(author: &str, email: &str, trailers: &str) -> String {
     let identity = format!("{author} {email}").to_lowercase();
     if BOT_MARKERS.iter().any(|marker| identity.contains(marker)) {
         return "bot".to_owned();
     }
-    let attributed = format!("{trailers} {subject}").to_lowercase();
+    // Only authorship metadata attributes a commit. A subject is prose: "Fix
+    // cursor pagination" names no agent, and reading it marked ordinary history
+    // as agent-written.
+    let attributed = trailers.to_lowercase();
     let agent = AGENT_MARKERS
         .iter()
         .any(|marker| attributed.contains(marker) || identity.contains(marker));
-    if !agent {
-        return "unknown".to_owned();
-    }
-    // An agent is named. If a person's identity is on the commit as well, they
-    // reviewed and took ownership of the output; that is weaker than authorship
-    // but stronger than an unattended write.
-    if AGENT_MARKERS.iter().any(|marker| identity.contains(marker)) {
-        "ai_generated".to_owned()
-    } else {
-        "human_review".to_owned()
-    }
+    // A person's name in the author field beside an agent trailer is not evidence
+    // that anyone reviewed the output: it is whoever ran the tool. Reading it as
+    // `human_review` let trailer-marked commits climb to `prevalent`, which the
+    // provenance ceiling forbids end to end for agent `Co-authored-by:` commits.
+    if agent { "ai_generated" } else { "unknown" }.to_owned()
 }
 
 /// A sweeping refactor touches hundreds of files and says very little about any
@@ -2067,7 +2064,7 @@ fn scan_git_history(
             tree: parts[2].to_owned(),
             author_date: parts[3].to_owned(),
             subject: parts[7].to_owned(),
-            provenance: commit_provenance(parts[4], parts[5], parts[6], parts[7]),
+            provenance: commit_provenance(parts[4], parts[5], parts[6]),
         });
     }
     let by_sha: BTreeMap<&str, &CommitInfo> = commits.iter().map(|c| (c.sha.as_str(), c)).collect();
@@ -2297,6 +2294,12 @@ fn scan_git_history(
             } else {
                 "unreviewed-branch".to_owned()
             };
+            // A ref is evidence about the commit it names, so it carries that
+            // commit's authorship; left at the default it reported an agent
+            // commit's revision as `unknown`.
+            if let Some(commit) = by_sha.get(sha) {
+                record.provenance = commit.provenance.clone();
+            }
             record.revision = Some(sha.to_owned());
             record.branch = Some(name.trim_start_matches("refs/heads/").to_owned());
             scan.unit_ids.insert(native_id);
@@ -2332,7 +2335,7 @@ fn scan_github_export(source: &Path, repo: &Repository) -> Result<SourceScan, Co
     // progress: the scan is refused rather than read as "everything was
     // removed". Any other unreadable or unrelated JSON is skipped and counted.
     let last_written = files.last().map(|(_, path)| path.clone());
-    let mut exports: Vec<(String, i64, PathBuf, Map<String, Value>)> = Vec::new();
+    let mut exports: Vec<(Option<String>, i64, PathBuf, Map<String, Value>)> = Vec::new();
     for (mtime, path) in files {
         let bytes = read_bounded(&path)?;
         check_budget(&mut scan, bytes.len())?;
@@ -2365,12 +2368,17 @@ fn scan_github_export(source: &Path, repo: &Repository) -> Result<SourceScan, Co
             scan.skip("github_export: JSON document is not an export");
             continue;
         }
-        let time = export_time(&map).unwrap_or_else(|| mtime_rfc3339(mtime));
-        exports.push((time, mtime, path, map));
+        exports.push((export_time(&map), mtime, path, map));
     }
     // The export's own time orders snapshots (its header, else its latest
     // item update); a checkout gives files near-identical modification times,
-    // which made "newest" a lexical accident.
+    // which made "newest" a lexical accident. An export's own time and a file
+    // time are different clocks, so when any export carries no own time,
+    // all are ordered by file time: an undated newest export is the newest,
+    // and a dated one written after it is not demoted by old record times.
+    if exports.iter().any(|export| export.0.is_none()) {
+        exports.iter_mut().for_each(|export| export.0 = None);
+    }
     exports.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
     let mut latest: BTreeMap<String, SourceRecord> = BTreeMap::new();
     let mut newest_ids: BTreeSet<String> = BTreeSet::new();
@@ -2511,12 +2519,6 @@ fn export_time(map: &Map<String, Value>) -> Option<String> {
         .filter_map(|item| item.get("updatedAt").and_then(Value::as_str))
         .filter_map(crate::time::normalize_foreign_time)
         .max()
-}
-
-fn mtime_rfc3339(seconds: i64) -> String {
-    chrono::DateTime::from_timestamp(seconds, 0)
-        .map(crate::time::format_rfc3339_millis)
-        .unwrap_or_default()
 }
 
 // --------------------------------------------------------------------------
@@ -4462,6 +4464,19 @@ fn derive_answers(builder: &mut FactBuilder<'_>, _key: &str, rows: &[&Observatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_trailer_beside_a_human_author_is_not_human_review() {
+        let trailer = "Claude <noreply@anthropic.com>";
+        assert_eq!(
+            commit_provenance("Ada", "ada@example.invalid", trailer),
+            "ai_generated"
+        );
+        assert_eq!(
+            commit_provenance("Ada", "ada@example.invalid", ""),
+            "unknown"
+        );
+    }
 
     fn git_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("temp dir");

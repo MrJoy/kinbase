@@ -248,6 +248,15 @@ Enabling it changes the content identity of records that held a secret: the next
 
 This is the same `secret_mask` behaviour Kindex and signet-eval implement.
 
+## Native Stop hooks
+
+Codex and Claude Code expect a native hook response on stdout. Kinbase's
+native `Stop` checkpoints the session without sending a response. Diagnostics
+go to stderr, and the exit status still reports the checkpoint outcome.
+The length-prefixed evidence envelope described in
+[architecture §9](spec/architecture.md#9-host-lifecycle-and-permission-contract)
+is available in the explicit `--json` checkpoint receipt.
+
 ## Building and running
 
 With Nix flakes enabled:

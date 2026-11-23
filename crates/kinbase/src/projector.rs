@@ -52,6 +52,30 @@ const TIERS: [(&str, i64, i64); 7] = [
     ("broad_search", 250, 250),
 ];
 
+/// The Unknowns a projection may raise its one question about, in order.
+///
+/// Blocking Unknowns come first and keep their question per decision: the
+/// decision is what they block. An Unknown that blocks nothing here is asked
+/// once, ever: one that already has a question is skipped. Otherwise the
+/// first such Unknown returned its existing question on every projection and
+/// took the one-question break, so a second contested key was never asked;
+/// and asking it under each caller's decision (the id hashes the decision)
+/// opened one question per decision for a single conflict.
+fn questions_to_raise<'a>(
+    blocking: Vec<&'a UnknownOut>,
+    elsewhere: Vec<&'a UnknownOut>,
+    already_asked: impl Fn(&str) -> bool,
+) -> Vec<&'a UnknownOut> {
+    blocking
+        .into_iter()
+        .chain(
+            elsewhere
+                .into_iter()
+                .filter(|unknown| !already_asked(&unknown.unknown_id)),
+        )
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UnknownOut {
     pub(crate) unknown_id: String,
@@ -335,6 +359,7 @@ pub fn project_with(
         sources.push((evidence.clone(), crate::StoreKind::Codebase));
     }
     let mut evidence_fact_count = 0usize;
+    let mut own_shrugs: BTreeMap<(String, String), String> = BTreeMap::new();
     for (index, (source, store)) in sources.iter().enumerate() {
         let store_view = load_view(launcher, source, *store, as_of)?;
         conflict_event_ids.extend(
@@ -346,11 +371,42 @@ pub fn project_with(
         );
         if index >= 2 {
             evidence_fact_count += store_view.view.facts.len();
+        } else {
+            // Only this repository's own stores may settle its questions: a
+            // shrug held by an evidence repository is that repository's ruling.
+            own_shrugs.extend(
+                store_view
+                    .view
+                    .facts
+                    .iter()
+                    .filter(|fact| fact.atom_kind == "shrug" && fact.status == "current")
+                    .map(|fact| {
+                        (
+                            (fact.logical_key.clone(), fact.scope.clone()),
+                            fact.fact_id.clone(),
+                        )
+                    }),
+            );
         }
         facts.extend(store_view.view.facts);
         view_unknowns.extend(store_view.view.unknowns);
         ingested_events.extend(store_view.events);
         references.extend(store_view.references);
+    }
+    // A `shrug` ruled after a question was raised settles that question too.
+    // The reducer drops the key's derived Unknowns, but a question already
+    // raised and its persisted Unknown stayed open for every later read, so the
+    // shrug never became terminal (amendment 003, `shrug`). Closed before the
+    // closure set is read, so this projection already honours it.
+    // A failed closure must not refuse the projection: the question stays
+    // open, which is the state it was already in, and the failure is reported.
+    if recording == Recording::Full && !own_shrugs.is_empty() {
+        if let Err(error) = crate::questions::close_shrugged(repo, &own_shrugs) {
+            crate::output::diagnostic(
+                "shrug-closure-failed",
+                json!({"code": error.code, "message": error.message}),
+            );
+        }
     }
     // A closure record is authoritative across stores: the original Unknown
     // remains in append-only history, but no later projection may treat it as
@@ -616,7 +672,15 @@ pub fn project_with(
         ));
     }
 
-    let question_id = if !has_blocking_unknown || recording == Recording::ReadOnly {
+    // A contested key asks even when it blocks nothing this projection decides.
+    // Gating the question stage on a blocker alone left the conflict branch
+    // below unreachable, so a conflict on a key nobody named as blocked was
+    // never asked about (amendment 003, `unknown`).
+    let has_open_conflict = open_unknowns
+        .iter()
+        .any(|unknown| unknown.kind == "conflict");
+    let may_ask = has_blocking_unknown || has_open_conflict;
+    let question_id = if !may_ask || recording == Recording::ReadOnly {
         None
     } else {
         let evidence: Vec<String> = context
@@ -664,12 +728,21 @@ pub fn project_with(
             .iter()
             .filter(|unknown| unknown.loss_if_absent >= 7_000 || unknown.kind == "conflict")
             .partition(|unknown| blocks(unknown));
-        for unknown in blocking.into_iter().chain(elsewhere) {
+        let to_ask = questions_to_raise(blocking, elsewhere, |unknown_id| {
+            crate::questions::decision_asked_for(repo, unknown_id).is_some()
+        });
+        // One new question per projection. A blocker already asked under this
+        // decision still answers for it (its question is the one reported), but
+        // the walk goes on, or a second blocker behind it is never asked.
+        for unknown in to_ask {
+            let asked_before = crate::questions::asked_under(repo, &unknown.unknown_id, decision);
             if let Some(id) =
                 crate::questions::ensure_question(repo, unknown, decision, &evidence, &remaining)?
             {
-                raised = Some(id);
-                break;
+                raised.get_or_insert(id);
+                if !asked_before {
+                    break;
+                }
             }
         }
         raised
@@ -689,7 +762,8 @@ pub fn project_with(
                     && evaluate_cached(fact, &context, &cache).marginal_value > 0
             }));
     let stopping_reason = stopping_reason(
-        question_id.is_some(),
+        // A question about a conflict elsewhere did not stop this projection.
+        question_id.is_some() && has_blocking_unknown,
         sufficiency,
         residents_filled,
         item_ceiling_hit,
@@ -2850,6 +2924,54 @@ mod set_fold_differential_tests {
             }
         }
         assert!(compared > 2_000);
+    }
+}
+
+#[cfg(test)]
+mod question_order_tests {
+    use super::{UnknownOut, questions_to_raise};
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    fn conflict(id: &str) -> UnknownOut {
+        UnknownOut {
+            unknown_id: id.to_owned(),
+            logical_key: id.to_owned(),
+            scope: String::new(),
+            decision_blocked: String::new(),
+            owner_role: String::new(),
+            owner_identity: String::new(),
+            question: String::new(),
+            evidence: Vec::new(),
+            loss_if_absent: 9_000,
+            status: "open".to_owned(),
+            kind: "conflict".to_owned(),
+        }
+    }
+
+    #[test]
+    fn every_open_conflict_gets_one_question_across_projections() {
+        let (first, second) = (conflict("unknown_a"), conflict("unknown_b"));
+        let asked = RefCell::new(BTreeSet::new());
+        // Each projection raises at most one question: the first it may ask.
+        let project = || {
+            let order = questions_to_raise(Vec::new(), vec![&first, &second], |id| {
+                asked.borrow().contains(id)
+            });
+            if let Some(unknown) = order.first() {
+                asked.borrow_mut().insert(unknown.unknown_id.clone());
+            }
+        };
+        project();
+        project();
+        assert_eq!(
+            *asked.borrow(),
+            BTreeSet::from(["unknown_a".to_owned(), "unknown_b".to_owned()])
+        );
+        let remaining = questions_to_raise(Vec::new(), vec![&first, &second], |id| {
+            asked.borrow().contains(id)
+        });
+        assert!(remaining.is_empty(), "a conflict was asked twice");
     }
 }
 

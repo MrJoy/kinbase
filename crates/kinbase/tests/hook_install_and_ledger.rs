@@ -431,8 +431,18 @@ fn wait_for_observation(personal: &Path, identity: &str) -> Value {
 }
 
 fn dispatch(world: &HostWorld, event: &str, stdin: &[u8], json: bool) -> std::process::Output {
+    dispatch_host(world, "claude", event, stdin, json)
+}
+
+fn dispatch_host(
+    world: &HostWorld,
+    host: &str,
+    event: &str,
+    stdin: &[u8],
+    json: bool,
+) -> std::process::Output {
     use std::io::Write as _;
-    let mut args = vec!["hooks", "dispatch", "claude", event];
+    let mut args = vec!["hooks", "dispatch", host, event];
     if json {
         args.push("--json");
     }
@@ -615,21 +625,62 @@ fn append_jsonl_refuses_a_record_that_is_not_canonical() {
 fn dispatch_refuses_a_malformed_envelope_and_says_so_on_stderr() {
     let temp = TempDir::new().expect("tempdir");
     let world = host_world(&temp);
-    let output = dispatch(&world, "Stop", b"not json at all", false);
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "a malformed envelope is still refused"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("UNSUPPORTED_HOST_VERSION"),
-        "the host surfaces stderr, so the reason must be there: {stderr:?}"
-    );
+    for host in ["codex", "claude"] {
+        let output = dispatch_host(&world, host, "Stop", b"not json at all", false);
+        assert_eq!(output.status.code(), Some(3), "{host}: {output:?}");
+        assert!(output.stdout.is_empty(), "{host}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("UNSUPPORTED_HOST_VERSION"),
+            "{host}: {stderr:?}"
+        );
+        assert!(stderr.contains("retryable:"), "{host}: {stderr:?}");
+        assert!(stderr.contains("evidence_id:"), "{host}: {stderr:?}");
+
+        let diagnostic = dispatch_host(&world, host, "Stop", b"not json at all", true);
+        assert_eq!(diagnostic.status.code(), Some(3), "{host}: {diagnostic:?}");
+        let document: Value = serde_json::from_slice(&diagnostic.stdout).expect("Stop error JSON");
+        assert_eq!(
+            document["error"]["code"],
+            "UNSUPPORTED_HOST_VERSION",
+            "{host}: {document}"
+        );
+    }
     assert!(
         !world.personal.join("session-checkpoints.jsonl").exists(),
         "nothing is checkpointed from a refused envelope"
     );
+}
+
+#[test]
+fn native_stop_reports_launcher_refusal_only_on_stderr() {
+    let temp = TempDir::new().expect("tempdir");
+    let world = host_world(&temp);
+    let config = world.config_home.join("kinbase/config.toml");
+    fs::set_permissions(config, fs::Permissions::from_mode(0o644)).expect("broaden config mode");
+
+    for host in ["codex", "claude"] {
+        let output = dispatch_host(&world, host, "Stop", b"{}", false);
+        assert_eq!(output.status.code(), Some(4), "{host}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("user config"), "{host}: {stderr:?}");
+        assert!(stderr.contains("remediation:"), "{host}: {stderr:?}");
+        assert!(output.stdout.is_empty(), "{host}: {output:?}");
+    }
+}
+
+#[test]
+fn malformed_native_stop_command_reports_usage_only_on_stderr() {
+    for host in ["codex", "claude"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kinbase"))
+            .args(["hooks", "dispatch", host, "Stop", "--unexpected"])
+            .output_alone()
+            .expect("run malformed Stop command");
+        assert_eq!(output.status.code(), Some(4), "{host}: {output:?}");
+        assert!(output.stdout.is_empty(), "{host}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("malformed command line"), "{host}: {stderr}");
+    }
 }
 
 #[test]
@@ -742,16 +793,26 @@ fn checkpoint_streams_only_this_sessions_records_from_shared_ledgers() {
 
 #[test]
 fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
-    use std::io::Write as _;
+    for host in ["codex", "claude"] {
+        assert_held_admission_on_native_stop(host);
+    }
+
+    // The same refusal from an ordinary command still exits 2.
+    let refused = kinbase::error::ContractError::user_action("REPO_UNCERTIFIED", "m", "r");
+    assert_eq!(refused.exit(), 2);
+    assert_eq!(refused.for_host_hook().exit(), 3);
+}
+
+fn assert_held_admission_on_native_stop(host: &str) {
     // A session outside any Git worktree that has an automatic candidate for
     // a shared destination: this host has nowhere to put it. That is held,
     // not failed — the candidate waits for a later checkpoint and the hook
     // stays quiet. Exit 2 would tell the host to refuse to stop and fire Stop
     // again, so it is never used.
     let temp = TempDir::new().expect("tempdir");
-    let world = host_world(&temp);
-    let outside = temp.path().join("not-a-repository");
-    fs::create_dir_all(&outside).expect("outside dir");
+    let mut world = host_world(&temp);
+    world.repo = temp.path().join("not-a-repository");
+    fs::create_dir_all(&world.repo).expect("outside dir");
     let canonical = "x";
     let candidate = json!({
         "admission_mode": "automatic",
@@ -765,31 +826,14 @@ fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
         .expect("candidate");
     let stop = json!({
         "session_id": "host-session-4",
-        "cwd": outside.display().to_string(),
+        "cwd": world.repo.display().to_string(),
         "hook_event_name": "Stop",
         "stop_hook_active": false
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kinbase"))
-        .current_dir(&outside)
-        .args(["hooks", "dispatch", "claude", "Stop"])
-        .env("HOME", &world.home)
-        .env("XDG_CONFIG_HOME", &world.config_home)
-        .env("XDG_STATE_HOME", world.home.join(".state"))
-        .env_remove("KINBASE_COMPANY_URL")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn_alone()
-        .expect("spawn");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(stop.to_string().as_bytes())
-        .expect("write");
-    let output = child.wait_with_output().expect("output");
+    let output = dispatch_host(&world, host, "Stop", stop.to_string().as_bytes(), false);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_ne!(output.status.code(), Some(2), "{stderr}");
+    assert!(output.status.success(), "{host}: {stderr}");
+    assert!(output.stdout.is_empty(), "{host}: {output:?}");
     assert!(
         !stderr.contains("REPO_UNCERTIFIED"),
         "an unplaceable candidate is not a refusal to report: {stderr}"
@@ -808,10 +852,23 @@ fn a_host_hook_holds_a_candidate_it_cannot_place_and_never_exits_2() {
         "{checkpoints}"
     );
 
-    // The same refusal from an ordinary command still exits 2.
-    let refused = kinbase::error::ContractError::user_action("REPO_UNCERTIFIED", "m", "r");
-    assert_eq!(refused.exit(), 2);
-    assert_eq!(refused.for_host_hook().exit(), 3);
+    let output = dispatch_host(&world, host, "Stop", stop.to_string().as_bytes(), true);
+    assert!(output.status.success(), "{host}: {output:?}");
+    let receipt: Value = serde_json::from_slice(&output.stdout).expect("Stop receipt");
+    assert_eq!(receipt["checkpointed"], true, "{host}: {receipt}");
+    assert_eq!(receipt["session_id"], "host-session-4");
+    assert!(receipt["envelope"].is_string(), "{host}: {receipt}");
+
+    // Make the checkpoint append fail after Stop is selected from stdin.
+    let checkpoint = world.personal.join("session-checkpoints.jsonl");
+    fs::rename(&checkpoint, world.personal.join("previous-checkpoint.jsonl"))
+        .expect("move checkpoint aside");
+    fs::create_dir(&checkpoint).expect("make checkpoint ledger unwritable");
+    let output = dispatch_host(&world, host, "native", stop.to_string().as_bytes(), false);
+    assert!(!output.status.success(), "{host}: {output:?}");
+    assert!(output.stdout.is_empty(), "{host}: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("evidence_id:"), "{host}: {stderr}");
 }
 
 #[test]

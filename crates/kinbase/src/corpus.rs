@@ -1209,12 +1209,10 @@ pub fn admit(
             // document would arrive with exactly the weight of the commits it is
             // meant to outrank. Provenance still clamps this, so an agent-written
             // document claiming `north_star` cannot reach `ratified`.
-            standing: match observation.atom_kind.as_deref() {
-                Some("north_star") | Some("invariant") | Some("directional") => {
-                    "ratified".to_owned()
-                }
-                _ => "present".to_owned(),
-            },
+            standing: crate::model::observation_standing(
+                observation.atom_kind.as_deref(),
+                &observation.provenance,
+            ),
             provenance: observation.provenance.clone(),
             governs_paths: observation.governs_paths.clone(),
             anchors: observation.anchors.clone(),

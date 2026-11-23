@@ -316,18 +316,20 @@ pub const CONFIG_FILE: &str = "kinbase.toml";
 /// only when it is genuinely a kinbase config.
 fn config_path_for(kin: &std::path::Path) -> Option<std::path::PathBuf> {
     let ours = kin.join(CONFIG_FILE);
-    if ours.exists() {
-        return Some(ours);
-    }
     let legacy = kin.join("config");
-    if legacy.exists()
-        && std::fs::read_to_string(&legacy)
-            .ok()
-            .is_some_and(|text| RepoConfig::parse(&text).is_ok())
-    {
+    // A `.kin/config` naming our schema is kinbase's own, so malformed bytes there
+    // must refuse with exit 5 (spec/cli.md first-run table), not be skipped as
+    // Kindex's; Kindex's YAML never names `kinbase-repo/`.
+    const MARKER: &[u8] = b"kinbase-repo/";
+    let bytes = std::fs::read(&legacy).unwrap_or_default();
+    let legacy_names_ours = bytes.windows(MARKER.len()).any(|window| window == MARKER);
+    let legacy_parses = || {
+        std::str::from_utf8(&bytes).is_ok_and(|text| RepoConfig::parse(text).is_ok())
+    };
+    if legacy_names_ours && (!ours.exists() || !legacy_parses()) {
         return Some(legacy);
     }
-    None
+    ours.exists().then_some(ours)
 }
 
 impl Repository {

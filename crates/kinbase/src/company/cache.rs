@@ -33,6 +33,21 @@ fn sqlite_error(context: &str) -> impl Fn(rusqlite::Error) -> ContractError + '_
     move |error| ContractError::internal(format!("{context}: {error}"))
 }
 
+pub(crate) fn pin_bindings(
+    connection: &Connection,
+    hint: &str,
+    legacy: &str,
+) -> rusqlite::Result<Vec<(String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT hint, repository_uuid, certificate_digest FROM pins WHERE hint IN (?1, ?2) ORDER BY hint",
+    )?;
+    statement
+        .query_map(params![hint, legacy], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect()
+}
+
 const CACHE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
      CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), bytes BLOB NOT NULL, digest TEXT NOT NULL, stored_at TEXT NOT NULL);
      CREATE TABLE IF NOT EXISTS pins(hint TEXT PRIMARY KEY, repository_uuid TEXT NOT NULL, certificate_digest TEXT NOT NULL, pinned_at TEXT NOT NULL, cursor TEXT NOT NULL);
@@ -763,32 +778,59 @@ impl Cache {
         cursor: &str,
         now: &str,
     ) -> Result<PinOutcome, ContractError> {
-        let connection = self.connection()?;
-        let existing: Option<(String, String)> = connection
-            .query_row(
-                "SELECT repository_uuid, certificate_digest FROM pins WHERE hint=?1",
-                params![hint],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sqlite_error("pin lookup"))?;
-        match existing {
-            Some((uuid, existing_digest))
-                if uuid == repository_uuid && existing_digest == digest =>
-            {
-                Ok(PinOutcome::Unchanged)
-            }
-            Some((uuid, digest)) => Ok(PinOutcome::Conflict { uuid, digest }),
-            None => {
-                connection
-                    .execute(
-                        "INSERT INTO pins(hint, repository_uuid, certificate_digest, pinned_at, cursor) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![hint, repository_uuid, digest, now, cursor],
-                    )
-                    .map_err(sqlite_error("pin"))?;
-                Ok(PinOutcome::Pinned)
-            }
+        self.pin_origin(hint, hint, repository_uuid, digest, cursor, now)
+    }
+
+    pub(crate) fn pin_origin(
+        &self,
+        hint: &str,
+        legacy_hint: &str,
+        repository_uuid: &str,
+        digest: &str,
+        cursor: &str,
+        now: &str,
+    ) -> Result<PinOutcome, ContractError> {
+        let check_existing = |connection: &Connection| -> Result<_, ContractError> {
+            let existing =
+                pin_bindings(connection, hint, legacy_hint).map_err(sqlite_error("pin lookup"))?;
+            let outcome = existing
+                .iter()
+                .find(|(_, uuid, pinned_digest)| uuid != repository_uuid || pinned_digest != digest)
+                .map(|(_, uuid, digest)| PinOutcome::Conflict {
+                    uuid: uuid.clone(),
+                    digest: digest.clone(),
+                })
+                .or_else(|| {
+                    existing
+                        .iter()
+                        .any(|(key, _, _)| key == hint)
+                        .then_some(PinOutcome::Unchanged)
+                });
+            Ok((outcome, !existing.is_empty()))
+        };
+        // SessionStart usually sees an existing pin. Only a new binding
+        // needs the writer lock, and it is checked again under that lock.
+        if let (Some(outcome), _) = check_existing(self.connection()?)? {
+            return Ok(outcome);
         }
+        self.in_write_transaction("pin origin", |cache| {
+            let connection = cache.connection()?;
+            let (outcome, carries_legacy) = check_existing(connection)?;
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
+            }
+            connection
+                .execute(
+                    "INSERT INTO pins(hint, repository_uuid, certificate_digest, pinned_at, cursor) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![hint, repository_uuid, digest, now, cursor],
+                )
+                .map_err(sqlite_error("pin"))?;
+            Ok(if carries_legacy {
+                PinOutcome::Unchanged
+            } else {
+                PinOutcome::Pinned
+            })
+        })
     }
 
     pub fn pins(&self) -> Vec<Value> {

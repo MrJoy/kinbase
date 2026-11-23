@@ -564,9 +564,13 @@ pub fn enforce_private_file(path: &Path, role: &str) -> Result<(), ContractError
 /// Load the launcher-only user config. `Ok(None)` is Codebase-only mode.
 pub fn load_user_config() -> Result<Option<UserConfig>, ContractError> {
     let path = user_config_path();
-    if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
-        crate::secret_mask::configure(None);
-        return Ok(None);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::secret_mask::configure(None);
+            return Ok(None);
+        }
+        Err(error) => return Err(ContractError::unreadable("user config", &error)),
     }
     enforce_private_file(&path, "user config")?;
     let text = std::fs::read_to_string(&path)

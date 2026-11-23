@@ -37,6 +37,42 @@ impl Launcher {
     /// non-allowlisted descriptor refuses here, before shared work. The first
     /// load in a process attests; later loads reuse that launch-time record.
     pub fn load() -> Result<Self, ContractError> {
+        let (user, selection, attestation) = Self::prepare()?;
+        let shared = Self::load_shared(user.as_ref())?;
+        Ok(Self::from_config(user, selection, attestation, shared))
+    }
+
+    /// Configuration parsing and descriptor attestation must succeed before
+    /// a hook handles input. Shared credential errors are returned separately
+    /// so checkpoints can still use the parsed config to redact their output.
+    pub(crate) fn load_for_hook() -> Result<
+        (
+            Result<Self, ContractError>,
+            Option<crate::selection::Scrubber>,
+        ),
+        ContractError,
+    > {
+        let (user, selection, attestation) = Self::prepare()?;
+        let shared = Self::load_shared(user.as_ref());
+        let scrubber = user
+            .as_ref()
+            .filter(|user| !user.companies.is_empty())
+            .map(|user| {
+                let selected = match &selection {
+                    crate::selection::Outcome::Selected { name, .. } if shared.is_ok() => {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                };
+                crate::selection::Scrubber::new(user, selected)
+            });
+        Ok((
+            shared.map(|shared| Self::from_config(user, selection, attestation, shared)),
+            scrubber,
+        ))
+    }
+
+    fn prepare() -> Result<(Option<UserConfig>, crate::selection::Outcome, Value), ContractError> {
         let mut user = crate::config::load_user_config()?;
         let selection = match user.as_mut() {
             Some(user) => crate::selection::apply(user),
@@ -54,19 +90,31 @@ impl Launcher {
                 ATTESTATION.get_or_init(|| attestation).clone()
             }
         };
-        let shared = match &user {
-            Some(user) => user.shared()?,
-            None => crate::config::codebase_only_shared(),
-        };
+        Ok((user, selection, fd_attestation))
+    }
+
+    fn load_shared(user: Option<&UserConfig>) -> Result<SharedConfig, ContractError> {
+        match user {
+            Some(user) => user.shared(),
+            None => Ok(crate::config::codebase_only_shared()),
+        }
+    }
+
+    fn from_config(
+        user: Option<UserConfig>,
+        selection: crate::selection::Outcome,
+        fd_attestation: Value,
+        shared: SharedConfig,
+    ) -> Self {
         let company_env_present = std::env::var_os("KINBASE_COMPANY_URL").is_some();
-        Ok(Self {
+        Self {
             mode: shared.mode,
             user,
             shared,
             fd_attestation,
             company_env_present,
             selection,
-        })
+        }
     }
 
     /// What `status` and `doctor` say about Company selection under the
@@ -126,23 +174,6 @@ impl Launcher {
         }))
     }
 
-    /// `scrub_for_hook` applied to every string inside a JSON value, so a
-    /// Company named like a JSON literal (`true`, `null`) can neither break
-    /// the document nor be skipped.
-    pub fn scrub_value_for_hook(&self, value: &mut Value) {
-        fn walk(scrubber: &crate::selection::Scrubber, value: &mut Value) {
-            match value {
-                Value::String(text) => *text = scrubber.scrub(text),
-                Value::Array(items) => items.iter_mut().for_each(|item| walk(scrubber, item)),
-                Value::Object(map) => map.values_mut().for_each(|item| walk(scrubber, item)),
-                _ => {}
-            }
-        }
-        if let Some(scrubber) = self.hook_scrubber() {
-            walk(&scrubber, value);
-        }
-    }
-
     /// Several Companies are configured (`[companies.<name>]`).
     pub fn named_form(&self) -> bool {
         self.user
@@ -167,27 +198,6 @@ impl Launcher {
         }
         let access = self.shared.company.as_ref()?;
         crate::selection::cached_company_id(&access.cache_root)
-    }
-
-    /// Text bound for a hook's output, with every other configured Company's
-    /// name, URL, cache path and cached company_id replaced (named form only).
-    pub fn scrub_for_hook(&self, text: &str) -> String {
-        match self.hook_scrubber() {
-            Some(scrubber) => scrubber.scrub(text),
-            None => text.to_owned(),
-        }
-    }
-
-    fn hook_scrubber(&self) -> Option<crate::selection::Scrubber> {
-        let user = self
-            .user
-            .as_ref()
-            .filter(|user| !user.companies.is_empty())?;
-        let selected = match &self.selection {
-            crate::selection::Outcome::Selected { name, .. } => Some(name.as_str()),
-            _ => None,
-        };
-        Some(crate::selection::Scrubber::new(user, selected))
     }
 
     pub fn principal_id(&self) -> &str {

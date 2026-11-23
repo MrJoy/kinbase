@@ -283,9 +283,18 @@ impl World {
         json: bool,
         session: &str,
     ) -> Output {
+        let envelope = serde_json::json!({
+            "hook_event_name": event,
+            "session_id": session,
+            "cwd": repo.to_string_lossy()
+        });
+        self.hook_envelope(process_cwd, event, json, &envelope)
+    }
+
+    fn hook_envelope(&self, cwd: &Path, event: &str, json: bool, envelope: &Value) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kinbase"));
         command
-            .current_dir(process_cwd)
+            .current_dir(cwd)
             .args(["hooks", "dispatch", "claude", event]);
         if json {
             command.arg("--json");
@@ -296,11 +305,6 @@ impl World {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn_alone().unwrap();
-        let envelope = serde_json::json!({
-            "hook_event_name": event,
-            "session_id": session,
-            "cwd": repo.to_string_lossy()
-        });
         child
             .stdin
             .take()
@@ -613,6 +617,240 @@ fn a_failed_git_origin_lookup_refuses_selection_by_certificate() {
     assert_eq!(code, Some(4), "{selection}");
     assert_eq!(reason(&status), Some("company-unverifiable"), "{status}");
     assert_eq!(selection["evidence"]["origin_unreadable"], true, "{status}");
+}
+
+#[test]
+fn equivalent_git_origins_match_another_companys_hint() {
+    let world = World::new();
+    let alpha = world.repo(
+        "alpha-normalized",
+        "git@github.com:alpha-org/normalized.git",
+    );
+    world.certify(&alpha, ALPHA);
+    for origin in [
+        "https://git-user@gitHub.com/Beta-Org/normalized.git",
+        "ssh://git@github.com:2222/beta-org/normalized.git",
+    ] {
+        let fork = world.repo("origin-alias", origin);
+        fs::create_dir_all(fork.join(".kin")).unwrap();
+        fs::copy(
+            alpha.join(".kin/kinbase.toml"),
+            fork.join(".kin/kinbase.toml"),
+        )
+        .unwrap();
+        let (code, status) = world.status(&fork);
+        assert_eq!(code, Some(4), "{}", status["company_selection"]);
+        assert_eq!(reason(&status), Some("company-ambiguous"));
+        assert_eq!(
+            status["company_selection"]["evidence"]["origin"],
+            "github.com/beta-org/normalized"
+        );
+        fs::remove_dir_all(fork).unwrap();
+    }
+}
+
+#[test]
+fn a_legacy_pin_is_kept_and_checked_alongside_the_canonical_pin() {
+    let world = World::new();
+    let repo = world.repo(
+        "legacy-pin",
+        "ssh://git@github.com:2222/alpha-org/legacy.git",
+    );
+    let uuid = world.certify(&repo, ALPHA);
+    let (code, status) = world.status(&repo);
+    assert_eq!(code, Some(0), "{}", status["certificate"]);
+    let digest = status["certificate"]["digest"].as_str().unwrap();
+    let cache = world.temp.path().join(format!("cache-{ALPHA}"));
+    let db = rusqlite::Connection::open(cache.join(kinbase::company::cache::CACHE_FILE)).unwrap();
+    let canonical = "github.com/alpha-org/legacy";
+    let legacy = "github.com/2222/alpha-org/legacy";
+    db.execute("DELETE FROM pins", []).unwrap();
+    db.execute(
+        "INSERT INTO pins VALUES (?1, ?2, ?3, '2025-01-01T00:00:00Z', '1')",
+        rusqlite::params![legacy, uuid, digest],
+    )
+    .unwrap();
+
+    let (code, status) = world.status(&repo);
+    assert_eq!(code, Some(0), "{}", status["certificate"]);
+    assert_eq!(
+        status["company_selection"]["evidence"]["pin_claims"],
+        serde_json::json!([ALPHA])
+    );
+    let count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM pins WHERE hint IN (?1, ?2)",
+            rusqlite::params![canonical, legacy],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "the canonical pin should carry the existing binding forward"
+    );
+
+    db.execute(
+        "UPDATE pins SET certificate_digest = 'other' WHERE hint = ?1",
+        [legacy],
+    )
+    .unwrap();
+    let (_, status) = world.status(&repo);
+    assert_eq!(status["certificate"]["pin_state"], "conflict");
+    assert_eq!(status["certificate"]["valid"], false);
+}
+
+#[test]
+fn a_verified_snapshot_index_claims_the_uuid_without_installing_a_certificate() {
+    use kinbase::company::cache::Cache;
+    use kinbase::crypto::{PrivateKey, PublicKey};
+
+    let world = World::new();
+    let fork = fork_of_alpha(&world);
+    let alpha = world.temp.path().join("repos/alpha-src");
+    assert_eq!(world.status(&alpha).0, Some(0));
+    let cache = world.temp.path().join(format!("cache-{ALPHA}"));
+    let snapshot = Cache::open(&cache).unwrap().snapshot().unwrap().unwrap();
+    let root = PublicKey::load(&world.alpha.dir.join("company-root.pub"), "test root").unwrap();
+    fs::remove_dir_all(&cache).unwrap();
+    Cache::open(&cache)
+        .unwrap()
+        .store_snapshot(&snapshot, &root, &kinbase::time::now_rfc3339_millis())
+        .unwrap();
+
+    let (code, status) = world.status(&fork);
+    assert_eq!(code, Some(4), "{}", status["company_selection"]);
+    assert_eq!(reason(&status), Some("company-ambiguous"));
+    assert_eq!(
+        status["company_selection"]["evidence"]["holders"],
+        serde_json::json!([ALPHA])
+    );
+    let (_, status) = world.status(&alpha);
+    assert_eq!(status["certificate"]["valid"], false, "{status}");
+
+    let uuid = status["repository_uuid"].as_str().unwrap();
+    let correct_issuer =
+        PrivateKey::load(&world.alpha.dir.join("company-root.key"), "test root").unwrap();
+    let wrong_issuer = PrivateKey::generate();
+    let wrong_uuid = uuid::Uuid::new_v4().to_string();
+    let db = Cache::open(&cache).unwrap().connection.unwrap();
+    for (issuer, claimed_uuid) in [
+        (&wrong_issuer, uuid),
+        (&correct_issuer, wrong_uuid.as_str()),
+    ] {
+        let foreign = issuer
+            .sign_document(
+                "repo-certificate",
+                &serde_json::json!({
+                    "schema": kinbase::model::CERTIFICATE_SCHEMA,
+                    "repository_uuid": claimed_uuid,
+                    "company_id": world.alpha.company_id
+                }),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE certificates SET document = ?1, digest = ?2 WHERE repository_uuid = ?3",
+            rusqlite::params![
+                kinbase::json::jcs_text(&foreign),
+                kinbase::json::digest(&foreign),
+                uuid
+            ],
+        )
+        .unwrap();
+        let (_, status) = world.status(&fork);
+        assert_eq!(status["company_selection"]["outcome"]["selected"], BETA);
+        assert_eq!(
+            status["company_selection"]["evidence"]["holders"],
+            serde_json::json!([])
+        );
+    }
+}
+
+#[test]
+fn a_hook_scrubs_checkpoint_failures_when_company_credentials_are_unavailable() {
+    let world = World::new();
+    let alpha = world.repo("alpha-credential", "git@github.com:alpha-org/credential");
+    let beta = world.repo("beta-credential", "git@github.com:beta-org/credential");
+    world.certify(&alpha, ALPHA);
+    world.certify(&beta, BETA);
+    observe(
+        &world,
+        &alpha,
+        "missing-token",
+        "Company policy: every team must pin base images.",
+    );
+    fs::remove_file(world.beta.dir.join("facts.token")).unwrap();
+
+    for json in [true, false] {
+        let hook = world.hook_with(&beta, &beta, "Stop", json, "missing-token");
+        let output = text(&hook);
+        assert!(output.contains("candidate-admission-failed"), "{output}");
+        assert!(output.contains("company:[company]"), "{output}");
+        for canary in world.canaries(None) {
+            assert!(!output.contains(&canary), "{canary} leaked: {output}");
+        }
+        if !json {
+            assert!(hook.stdout.is_empty(), "{output}");
+        }
+    }
+}
+
+#[test]
+fn an_invalid_user_config_refuses_a_hook_prompt_before_recording_it() {
+    let world = World::new();
+    let repo = world.repo("bad-user-config", "git@github.com:alpha-org/config");
+    write_private(&world.config_dir().join("config.toml"), b"invalid = [");
+    let envelope = serde_json::json!({
+        "session_id": "masked-prompt",
+        "prompt": "fixture-secret-do-not-capture"
+    });
+    let assert_refused = || {
+        let hook = world.hook_envelope(&repo, "UserPromptSubmit", true, &envelope);
+        assert_eq!(hook.status.code(), Some(4), "{}", text(&hook));
+        assert!(!text(&hook).contains("fixture-secret-do-not-capture"));
+        assert!(
+            !world
+                .temp
+                .path()
+                .join("personal/observations.jsonl")
+                .exists()
+        );
+        assert!(!world.temp.path().join("state-home").exists());
+    };
+    assert_refused();
+
+    // An inaccessible configuration path must not become Codebase-only.
+    fs::remove_dir_all(world.config_dir()).unwrap();
+    write_private(&world.config_dir(), b"not a directory");
+    assert_refused();
+}
+
+#[test]
+fn a_refused_company_still_allows_the_configured_personal_prompt_mask() {
+    let world = World::new();
+    let repo = fork_of_alpha(&world);
+    let env_file = world.temp.path().join("fixture.env");
+    write_private(&env_file, b"FIXTURE_TOKEN=fixture-secret-for-mask-proof\n");
+    world.write_config(&format!(
+        "\n[secret_mask]\nfiles = [\"{}\"]\n",
+        env_file.display()
+    ));
+    let envelope = serde_json::json!({
+        "id": "masked-personal-prompt",
+        "prompt": "fixture-secret-for-mask-proof"
+    });
+    let hook = world.hook_envelope(&repo, "UserPromptSubmit", true, &envelope);
+    assert!(hook.status.success(), "{}", text(&hook));
+    let observations =
+        fs::read_to_string(world.temp.path().join("personal/observations.jsonl")).unwrap();
+    let observation = observations
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|observation| observation["native_id"] == "masked-personal-prompt")
+        .unwrap();
+    assert_eq!(
+        observation["content_digest"],
+        kinbase::hash::sha256_text("$FIXTURE_TOKEN")
+    );
 }
 
 #[test]

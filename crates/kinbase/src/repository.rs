@@ -1971,10 +1971,16 @@ pub fn build_trust(
         // Discovery-hint pin: the remote URL is only a hint; a changed UUID
         // for the same hint blocks with a steward-owned identity Unknown.
         if let Ok(remote) = crate::codebase::git(&repo.root, &["remote", "get-url", "origin"]) {
-            let hint = normalize_hint(&remote);
+            let legacy = legacy_normalize_hint(&remote);
+            let hint = if launcher.named_form() {
+                normalize_hint(&remote)
+            } else {
+                legacy.clone()
+            };
             if !hint.is_empty() && trust.certificate_valid {
-                match cache.pin(
+                match cache.pin_origin(
                     &hint,
+                    &legacy,
                     &uuid,
                     trust.certificate_digest.as_deref().unwrap_or_default(),
                     &trust.authority_cursor,
@@ -2196,18 +2202,60 @@ pub fn ensure_authority_snapshot_for(
 }
 
 pub fn normalize_hint(remote: &str) -> String {
+    let remote = remote.trim().to_lowercase();
+    for scheme in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(url) = remote.strip_prefix(scheme) {
+            let (authority, path) = url.split_once('/').unwrap_or((url, ""));
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            // The port identifies the transport endpoint, not a path segment.
+            // Keep IPv6 brackets and colons inside the host.
+            let host = host.rsplit_once(':').map_or(host, |(name, port)| {
+                if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
+                    name
+                } else {
+                    host
+                }
+            });
+            return finish_hint(format!("{host}/{path}"));
+        }
+    }
+    // SCP-style SSH. Only a colon before the first slash can delimit a
+    // host; a colon inside a bracketed IPv6 address is part of that host.
+    let first = remote.split('/').next().unwrap_or_default();
+    let host_spec =
+        first.split_once('@').map_or(
+            first,
+            |(user, host)| {
+                if user.contains(':') { first } else { host }
+            },
+        );
+    let host_start = first.len() - host_spec.len();
+    let after_bracket = host_spec.find(']').map_or(0, |end| end + 1);
+    if let Some(separator) = host_spec[after_bracket..].find(':') {
+        let separator = after_bracket + separator;
+        let host = &host_spec[..separator];
+        let path = &remote[host_start + separator + 1..];
+        return finish_hint(format!("{host}/{path}"));
+    }
+    legacy_normalize_hint(&remote)
+}
+
+pub(crate) fn legacy_normalize_hint(remote: &str) -> String {
     let mut hint = remote.trim().to_lowercase();
     for prefix in ["https://", "http://", "ssh://", "git@", "git://"] {
         if let Some(rest) = hint.strip_prefix(prefix) {
             hint = rest.to_owned();
         }
     }
-    hint = hint.replace(':', "/");
-    hint = hint
-        .trim_end_matches('/')
+    finish_hint(hint.replace(':', "/"))
+}
+
+fn finish_hint(hint: String) -> String {
+    hint.trim_end_matches('/')
         .trim_end_matches(".git")
-        .to_owned();
-    hint
+        .to_owned()
 }
 
 fn identity_unknown(uuid: &str, now: &str) -> Value {
@@ -2308,7 +2356,8 @@ pub fn issue_certificate(
         launcher.user.as_ref(),
     )?;
     let hint = crate::codebase::git(&repo.root, &["remote", "get-url", "origin"])
-        .map(|remote| normalize_hint(&remote))
+        // The service's existing issuance index uses legacy discovery keys.
+        .map(|remote| legacy_normalize_hint(&remote))
         .unwrap_or_default();
     let existing_uuid = repo.uuid_hint().map(str::to_owned);
     // An origin-less repository has no discovery hint. Sending "" made the

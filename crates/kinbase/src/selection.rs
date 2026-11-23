@@ -20,6 +20,7 @@
 use crate::config::{CompanyConfig, NamedCompany, UserConfig};
 use crate::crypto::PublicKey;
 use crate::error::ContractError;
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -438,10 +439,17 @@ pub fn gather(companies: &[NamedCompany], repo: &Path) -> Evidence {
         return evidence;
     };
     evidence.repository_uuid = repository.uuid_hint().map(str::to_owned);
-    match git_origin(&repository.root) {
-        Ok(origin) => evidence.origin = origin,
-        Err(()) => evidence.origin_unreadable = true,
-    }
+    let legacy_origin = match git_origin(&repository.root) {
+        Ok(Some((canonical, legacy))) => {
+            evidence.origin = Some(canonical);
+            Some(legacy)
+        }
+        Ok(None) => None,
+        Err(()) => {
+            evidence.origin_unreadable = true;
+            None
+        }
+    };
     for company in companies {
         if let Some(origin) = &evidence.origin
             && company
@@ -454,7 +462,7 @@ pub fn gather(companies: &[NamedCompany], repo: &Path) -> Evidence {
         match cache_evidence(
             &company.config,
             evidence.repository_uuid.as_deref(),
-            evidence.origin.as_deref(),
+            evidence.origin.as_deref().zip(legacy_origin.as_deref()),
         ) {
             Ok((holds, pins)) => {
                 if holds {
@@ -470,7 +478,7 @@ pub fn gather(companies: &[NamedCompany], repo: &Path) -> Evidence {
     evidence
 }
 
-fn git_origin(repo: &Path) -> Result<Option<String>, ()> {
+fn git_origin(repo: &Path) -> Result<Option<(String, String)>, ()> {
     let output =
         crate::codebase::git_output(repo, &["remote", "get-url", "origin"]).map_err(|_| ())?;
     match output.status.code() {
@@ -482,7 +490,10 @@ fn git_origin(repo: &Path) -> Result<Option<String>, ()> {
             if origin.is_empty() {
                 return Err(());
             }
-            Ok(Some(origin))
+            Ok(Some((
+                origin,
+                crate::repository::legacy_normalize_hint(url),
+            )))
         }
         _ => Err(()),
     }
@@ -494,52 +505,92 @@ fn git_origin(repo: &Path) -> Result<Option<String>, ()> {
 fn cache_evidence(
     company: &CompanyConfig,
     uuid: Option<&str>,
-    origin: Option<&str>,
+    origin: Option<(&str, &str)>,
 ) -> Result<(bool, bool), ()> {
-    let mut holds = false;
-    if let Some(uuid) = uuid {
-        let path = company
-            .cache_root
-            .join("repositories")
-            .join(uuid)
-            .join("certificate.json");
-        // `exists()` reads a permission error as absence, and an absent
-        // certificate lets another Company win; only NotFound is absence.
-        if present(&path)? {
-            let root = PublicKey::load(&company.root_public_key_file, "Company root public key")
-                .map_err(|_| ())?;
-            let bytes = std::fs::read(&path).map_err(|_| ())?;
-            let certificate = crate::json::parse_strict_value(&bytes).map_err(|_| ())?;
-            holds = PublicKey::verify_document("repo-certificate", &certificate)
-                .is_some_and(|signer| signer == root)
-                && certificate.get("repository_uuid").and_then(Value::as_str) == Some(uuid);
-        }
+    if uuid.is_none() && origin.is_none() {
+        return Ok((false, false));
     }
-    let pins = match origin {
-        Some(origin) => cache_pins(&company.cache_root, origin)?,
+    let path = company.cache_root.join(crate::company::cache::CACHE_FILE);
+    let connection = present(&path)?
+        .then(|| {
+            rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+        })
+        .transpose()
+        .map_err(|_| ())?;
+    let holds = match uuid {
+        Some(uuid) => cache_holds(company, connection.as_ref(), uuid)?,
         None => false,
+    };
+    let pins = match (connection.as_ref(), origin) {
+        (Some(connection), Some((hint, legacy))) => {
+            !crate::company::cache::pin_bindings(connection, hint, legacy)
+                .map_err(|_| ())?
+                .is_empty()
+        }
+        _ => false,
     };
     Ok((holds, pins))
 }
 
-fn cache_pins(cache_root: &Path, origin: &str) -> Result<bool, ()> {
-    let path = cache_root.join(crate::company::cache::CACHE_FILE);
-    if !present(&path)? {
+fn cache_holds(
+    company: &CompanyConfig,
+    connection: Option<&rusqlite::Connection>,
+    uuid: &str,
+) -> Result<bool, ()> {
+    let path = company
+        .cache_root
+        .join("repositories")
+        .join(uuid)
+        .join("certificate.json");
+    // An absent certificate lets another Company win. Only NotFound is
+    // absence, so a permission error must reach the caller.
+    let installed = present(&path)?
+        .then(|| {
+            crate::paths::read_bounded(
+                &path,
+                crate::repository::CERTIFICATE_CEILING,
+                "cached certificate",
+            )
+            .map_err(|_| ())
+        })
+        .transpose()?;
+    // The index includes signed certificates received in snapshots and can
+    // supply selection evidence without an installed file. It grants no trust:
+    // build_trust still resolves installed certificates through Cache::certificate.
+    let indexed = match connection {
+        Some(connection) => connection
+            .query_row(
+                "SELECT document FROM certificates WHERE repository_uuid = ?1",
+                [uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| ())?,
+        None => None,
+    };
+    if installed.is_none() && indexed.is_none() {
         return Ok(false);
     }
-    let connection = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|_| ())?;
-    let count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM pins WHERE hint = ?1",
-            [origin],
-            |row| row.get(0),
-        )
+    let root = PublicKey::load(&company.root_public_key_file, "Company root public key")
         .map_err(|_| ())?;
-    Ok(count > 0)
+    for bytes in installed
+        .as_deref()
+        .into_iter()
+        .chain(indexed.as_deref().map(str::as_bytes))
+    {
+        let document = crate::json::parse_strict_value(bytes).map_err(|_| ())?;
+        if crate::json::get_str(&document, "schema") == Some(crate::model::CERTIFICATE_SCHEMA)
+            && crate::json::get_str(&document, "repository_uuid") == Some(uuid)
+            && PublicKey::verify_document("repo-certificate", &document).as_ref() == Some(&root)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `path` exists, where any answer but yes or NotFound (a
@@ -662,6 +713,16 @@ impl Scrubber {
             text = replace_word(&text, needle);
         }
         replace_bound_destinations(&text, self.selected_id.as_deref())
+    }
+
+    /// Walk values before encoding so even names like `true` stay in strings.
+    pub fn scrub_value(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.scrub(text),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.scrub_value(item)),
+            Value::Object(map) => map.values_mut().for_each(|item| self.scrub_value(item)),
+            _ => {}
+        }
     }
 }
 

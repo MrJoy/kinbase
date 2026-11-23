@@ -2063,7 +2063,12 @@ fn split_sentences_keep(text: &str) -> Vec<String> {
 }
 
 pub fn checkpoint(session: &str, json: bool) -> Result<(), ContractError> {
-    let (record, failure) = checkpoint_internal(session, None)?;
+    let (record, failure) = checkpoint_internal(
+        session,
+        None,
+        || crate::launcher::Launcher::load().map(std::borrow::Cow::Owned),
+        |failure| crate::output::diagnostic("candidate-admission-failed", failure.clone()),
+    )?;
     if let Some(error) = failure {
         // The checkpoint is written; the command still reports the refusal,
         // and a text reader sees every candidate's outcome with it.
@@ -2087,9 +2092,12 @@ pub fn checkpoint(session: &str, json: bool) -> Result<(), ContractError> {
 /// envelope's `cwd`); without one the process cwd stands in. Admission
 /// checks a candidate against the same repository the launcher selected the
 /// Company for.
-pub fn checkpoint_internal(
+pub(crate) fn checkpoint_internal<'a>(
     session: &str,
     repo: Option<&Path>,
+    load_launcher: impl FnOnce()
+        -> Result<std::borrow::Cow<'a, crate::launcher::Launcher>, ContractError>,
+    report_failure: impl Fn(&Value),
 ) -> Result<(Value, Option<ContractError>), ContractError> {
     // A failed Company delivery or a crash after journaling is retried by the
     // ordinary session lifecycle; there is no proposal command to drain it.
@@ -2143,7 +2151,7 @@ pub fn checkpoint_internal(
         None => std::env::current_dir().map_err(io_error)?,
     };
     if !candidates.is_empty() {
-        let launcher = crate::launcher::Launcher::load();
+        let launcher = load_launcher();
         let latest = latest_receipts(&candidates.keys().map(String::as_str).collect());
         let mut decisions_synced = false;
         // Company last, as `observe` admits: a Codebase sibling committed
@@ -2199,7 +2207,7 @@ pub fn checkpoint_internal(
                 Err(error) => {
                     admission_failures += 1;
                     let failure = admission_failure(candidate, &error);
-                    crate::output::diagnostic("candidate-admission-failed", failure.clone());
+                    report_failure(&failure);
                     admissions.push(failure);
                     first_failure.get_or_insert(error);
                 }

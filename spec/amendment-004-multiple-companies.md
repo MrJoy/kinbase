@@ -47,9 +47,11 @@ discovery_hints = ["github.com/acme-corp/*", "gitlab.acme.example/platform/**"]
 
 - `M-01` Names are 1-32 characters of `a-z`, `0-9`, `-`. Each table accepts every
   `[company]` key with the same meaning, plus `discovery_hints`.
-- `M-02` `discovery_hints` are normalized exactly as an origin is for pins
-  (lowercase; scheme and `git@` removed; `:` to `/`; `.git` removed). `*` matches
-  within one path segment, `**` across segments.
+- `M-02` Named Company hints and new local pins use lowercase Git host and path.
+  Repository identity omits the URL scheme, userinfo, port, and trailing `.git`.
+  `*` matches within one path segment, `**` across segments. The exact legacy
+  key for the configured remote is checked alongside the canonical key. A verifying
+  matching legacy pin can add the canonical binding, and a conflict blocks trust.
 - `M-03` Two Companies sharing a `url`, a `root_public_key_file`, or overlapping
   `cache_root`s is refused when the config is read.
 - `M-04` Client and maintainer keys default to `<config dir>/companies/<name>/`.
@@ -67,9 +69,11 @@ discovery_hints = ["github.com/acme-corp/*", "gitlab.acme.example/platform/**"]
   envelope `cwd`, else the process cwd); `repo issue --company <name>` names a
   Company; `repo init` counts the certificate being installed as evidence.
 - `S-02` Evidence, from configured Companies only: a Company **holds** the repository
-  when its cache keeps a certificate for the `repository_uuid_hint` that verifies
-  against its own root; its `discovery_hints` match the normalized origin; its cache
-  pins that origin.
+  when its cache keeps an installed or indexed certificate for the
+  `repository_uuid_hint` that verifies against its own root; its `discovery_hints`
+  match the normalized origin; its cache pins that origin. A signed certificate
+  indexed from a snapshot contributes selection evidence. Trust still requires
+  the installed certificate file.
 - `S-03` One Company in the union of the evidence is selected; none is Codebase-only
   mode; two or more is `CONFIG_INVARIANT` `company-ambiguous`. No kind of evidence
   overrides another. The UUID is worktree bytes and a certificate binds no origin, so
@@ -94,6 +98,8 @@ discovery_hints = ["github.com/acme-corp/*", "gitlab.acme.example/platform/**"]
   Claude a constant `systemMessage` the person sees.
 - `H-03` Hook output carries no Company name, URL, cache path or company_id of a
   Company other than the selected one; names appear only in `status` and `doctor`.
+  Credential errors leave redaction in place for checkpoint diagnostics and
+  receipts. An unreadable or invalid user config refuses before prompt capture.
 - `H-04` A Company candidate minted under the named form has destination
   `company:<company_id>` and records its `repository_uuid`. A checkpoint admits it
   only from that repository with that Company selected; otherwise it is held.

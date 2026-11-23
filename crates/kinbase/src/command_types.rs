@@ -246,6 +246,12 @@ pub enum HookCommand {
     Dispatch { host: Host, event: String },
 }
 
+impl HookCommand {
+    pub(crate) fn is_stop_dispatch(&self) -> bool {
+        matches!(self, Self::Dispatch { event, .. } if event == "Stop")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Host {
     Codex,

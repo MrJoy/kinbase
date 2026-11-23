@@ -1,9 +1,8 @@
 //! Host integration: plan, install, and dispatch native hooks.
 //!
 //! Hook configuration is user-level only. Plan is side-effect free, install is
-//! additive, and dispatch always consumes native stdin before emitting either
-//! the JSON receipt (including the base64 envelope) or the length-prefixed
-//! stream used by the non-JSON host mode.
+//! additive, and dispatch consumes native stdin before returning the host's
+//! response or an explicit JSON receipt (including the base64 envelope).
 
 use crate::error::{ContractError, ExitCode};
 use crate::repository::RepoContext;
@@ -24,9 +23,10 @@ const HOOK_EVENTS: [&str; 6] = [
 pub fn dispatch(
     command: crate::command_types::HookCommand,
     json: bool,
+    native_stop: &mut bool,
 ) -> Result<(), ContractError> {
     let hosted = matches!(command, crate::command_types::HookCommand::Dispatch { .. });
-    let result = run(command, json);
+    let result = run(command, json, native_stop);
     let result = if hosted {
         result.map_err(ContractError::for_host_hook)
     } else {
@@ -34,10 +34,11 @@ pub fn dispatch(
     };
     // The host shows a failed hook's stderr and hides its stdout; a refusal
     // whose reason lived only on stdout surfaced as "No stderr output". This
-    // covers a failed launcher load as well as a refused envelope. In JSON
-    // mode the top-level boundary already mirrors the document.
+    // covers a refusal inside dispatch. The CLI owns Stop diagnostics, including
+    // failures before dispatch, and mirrors explicit JSON errors on stderr.
     if hosted
         && !json
+        && !*native_stop
         && let Err(error) = &result
     {
         eprintln!("{}: {}", error.code, error.message);
@@ -48,14 +49,18 @@ pub fn dispatch(
     result
 }
 
-fn run(command: crate::command_types::HookCommand, json: bool) -> Result<(), ContractError> {
+fn run(
+    command: crate::command_types::HookCommand,
+    json: bool,
+    native_stop: &mut bool,
+) -> Result<(), ContractError> {
     let launcher = crate::launcher::Launcher::load()?;
     let ranges = &launcher.shared.hosts;
     match command {
         crate::command_types::HookCommand::Plan { host } => plan(host, ranges, json),
         crate::command_types::HookCommand::Install { host } => install(host, ranges, json),
         crate::command_types::HookCommand::Dispatch { host, event } => {
-            dispatch_event(host, &event, ranges, json)
+            dispatch_event(host, &event, ranges, json, native_stop)
         }
     }
 }
@@ -696,6 +701,7 @@ fn dispatch_event(
     event: &str,
     ranges: &crate::config::SharedHosts,
     json: bool,
+    native_stop: &mut bool,
 ) -> Result<(), ContractError> {
     let host = host_name(host_arg);
     let mut stdin = Vec::new();
@@ -740,6 +746,7 @@ fn dispatch_event(
             "Use a ratified Codex or Claude native envelope.",
         ));
     }
+    *native_stop = !json && event_type == "Stop";
     // A Stop the host re-fired because a Stop hook asked it to continue:
     // checkpointing again would repeat the same work at every re-fire.
     if matches!(event_type.as_str(), "Stop" | "SessionEnd" | "session-end")
@@ -935,6 +942,11 @@ fn dispatch_event(
             admission_failure = failure;
         }
         _ => {}
+    }
+    if *native_stop {
+        // Native Stop handlers have no decision to return after checkpointing.
+        // The length-prefixed evidence frame is not a native hook response.
+        return admission_failure.map_or(Ok(()), Err);
     }
     // The envelope carries the context the response names, each fact body
     // base64 encoded (architecture §9); it used to be a constant empty body.

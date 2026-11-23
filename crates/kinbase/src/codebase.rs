@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 pub const REPO_CONFIG_SCHEMA: &str = "kinbase-repo/1";
 pub const EVENT_CEILING: usize = 10_000;
@@ -269,13 +269,7 @@ fn still_holds(start: &Path, root: &Path) -> bool {
 }
 
 pub fn git(repo: &Path, args: &[&str]) -> Result<String, ContractError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(|error| ContractError::io("run git", error))?;
+    let output = git_output(repo, args).map_err(|error| ContractError::io("run git", error))?;
     if !output.status.success() {
         return Err(ContractError::user_action(
             "REPO_UNCERTIFIED",
@@ -288,6 +282,15 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String, ContractError> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub(crate) fn git_output(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
 }
 
 pub fn git_ok(repo: &Path, args: &[&str]) -> bool {

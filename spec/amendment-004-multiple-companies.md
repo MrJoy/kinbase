@@ -75,8 +75,10 @@ discovery_hints = ["github.com/acme-corp/*", "gitlab.acme.example/platform/**"]
   overrides another. The UUID is worktree bytes and a certificate binds no origin, so
   a worktree that copied another organization's `.kin/kinbase.toml` must not outvote
   its own origin.
-- `S-04` Evidence that cannot be read (root key, cache, certificate) refuses
-  (`company-unverifiable`); it never turns into a fall-through to another Company.
+- `S-04` Evidence that cannot be read (Git origin, root key, cache, certificate)
+  refuses (`company-unverifiable`). A repository without an origin contributes
+  no hint or pin evidence and can still be selected by a verifying certificate.
+  A failed Git origin lookup refuses selection even if a certificate verifies.
 - `S-05` Selection grants no trust. The selected Company's build_trust still checks
   signature, pins, revocation and freshness, and fails closed as today.
 - `S-06` `repo issue --company <name>` refuses `certified-elsewhere` when another

@@ -77,6 +77,7 @@ impl Refusal {
 pub struct Evidence {
     pub repository_uuid: Option<String>,
     pub origin: Option<String>,
+    pub origin_unreadable: bool,
     pub holders: Vec<String>,
     pub hint_matches: Vec<String>,
     pub pin_claims: Vec<String>,
@@ -101,6 +102,7 @@ impl Evidence {
         json!({
             "repository_uuid": self.repository_uuid,
             "origin": self.origin,
+            "origin_unreadable": self.origin_unreadable,
             "holders": self.holders,
             "hint_matches": self.hint_matches,
             "pin_claims": self.pin_claims,
@@ -401,6 +403,14 @@ fn identity_sharing(user: &UserConfig) -> Option<Refusal> {
 }
 
 fn unreadable(evidence: &Evidence) -> Option<Refusal> {
+    if evidence.origin_unreadable {
+        return Some(Refusal {
+            reason: "company-unverifiable",
+            message: "could not read this repository's Git origin; choosing by certificate alone could pick the wrong organization".to_owned(),
+            remediation: "Run `git remote get-url origin` in the worktree and repair its Git configuration before retrying.".to_owned(),
+            detail: json!({"reason": "company-unverifiable", "evidence": evidence.to_value()}),
+        });
+    }
     if evidence.unreadable.is_empty() {
         return None;
     }
@@ -428,10 +438,10 @@ pub fn gather(companies: &[NamedCompany], repo: &Path) -> Evidence {
         return evidence;
     };
     evidence.repository_uuid = repository.uuid_hint().map(str::to_owned);
-    evidence.origin = crate::codebase::git(&repository.root, &["remote", "get-url", "origin"])
-        .ok()
-        .map(|remote| crate::repository::normalize_hint(&remote))
-        .filter(|origin| !origin.is_empty());
+    match git_origin(&repository.root) {
+        Ok(origin) => evidence.origin = origin,
+        Err(()) => evidence.origin_unreadable = true,
+    }
     for company in companies {
         if let Some(origin) = &evidence.origin
             && company
@@ -458,6 +468,24 @@ pub fn gather(companies: &[NamedCompany], repo: &Path) -> Evidence {
         }
     }
     evidence
+}
+
+fn git_origin(repo: &Path) -> Result<Option<String>, ()> {
+    let output =
+        crate::codebase::git_output(repo, &["remote", "get-url", "origin"]).map_err(|_| ())?;
+    match output.status.code() {
+        // git-remote reserves status 2 for a remote it cannot find.
+        Some(2) => Ok(None),
+        Some(0) => {
+            let url = std::str::from_utf8(&output.stdout).map_err(|_| ())?;
+            let origin = crate::repository::normalize_hint(url);
+            if origin.is_empty() {
+                return Err(());
+            }
+            Ok(Some(origin))
+        }
+        _ => Err(()),
+    }
 }
 
 /// Whether this Company's cache holds a verifying certificate for `uuid`

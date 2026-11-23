@@ -573,6 +573,49 @@ fn unreadable_evidence_refuses_rather_than_falls_through() {
 }
 
 #[test]
+fn a_missing_git_origin_still_allows_selection_by_certificate() {
+    let world = World::new();
+    let repo = world.repo("local-only", "git@github.com:alpha-org/local.git");
+    world.certify(&repo, ALPHA);
+    let mut git = Command::new("git");
+    git.args(["remote", "remove", "origin"]).current_dir(&repo);
+    world.isolate(&mut git);
+    assert!(git.status_alone().unwrap().success());
+
+    let (_, status) = world.status(&repo);
+    not_a_selection_refusal(&status);
+    let selection = &status["company_selection"];
+    assert_eq!(selection["outcome"]["selected"], ALPHA, "{status}");
+    assert_eq!(selection["reason"], "held-certificate", "{status}");
+    assert!(selection["evidence"]["origin"].is_null(), "{status}");
+    assert_eq!(
+        selection["evidence"]["origin_unreadable"], false,
+        "{status}"
+    );
+}
+
+#[test]
+fn a_failed_git_origin_lookup_refuses_selection_by_certificate() {
+    let world = World::new();
+    let repo = world.repo("broken-origin", "git@github.com:alpha-org/broken.git");
+    world.certify(&repo, ALPHA);
+    // Git still discovers the worktree, but reading remotes rejects this
+    // valueless URL. A held certificate alone must not select a Company.
+    OpenOptions::new()
+        .append(true)
+        .open(repo.join(".git/config"))
+        .unwrap()
+        .write_all(b"\n[remote \"origin\"]\n\turl\n")
+        .unwrap();
+
+    let (code, status) = world.status(&repo);
+    let selection = &status["company_selection"];
+    assert_eq!(code, Some(4), "{selection}");
+    assert_eq!(reason(&status), Some("company-unverifiable"), "{status}");
+    assert_eq!(selection["evidence"]["origin_unreadable"], true, "{status}");
+}
+
+#[test]
 fn a_repository_no_company_claims_runs_codebase_only_and_says_so() {
     let world = World::new();
     let repo = world.repo("elsewhere", "git@example.com:other/elsewhere.git");

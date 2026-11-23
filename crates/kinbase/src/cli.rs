@@ -27,15 +27,18 @@ pub fn parse_or_exit() -> Cli {
             let args: Vec<String> = std::env::args().skip(1).collect();
             let json = args.iter().any(|arg| arg == "--json");
             let contract_error = usage_error(&args, error.to_string());
-            print_error(json, &contract_error, false);
+            let native_stop = args.starts_with(&["hooks".into(), "dispatch".into()])
+                && matches!(args.get(2).map(String::as_str), Some("codex" | "claude"))
+                && args.get(3).is_some_and(|event| event == "Stop");
+            print_error(json, &contract_error, native_stop);
             std::process::exit(contract_error.exit());
         }
     }
 }
 
 pub fn run(json: bool, command: Command) {
-    let native_stop = !json && matches!(&command, Command::Hooks(hook) if hook.is_stop_dispatch());
-    let result = dispatch(json, command);
+    let mut native_stop = !json && matches!(&command, Command::Hooks(hook) if hook.is_stop_dispatch());
+    let result = dispatch(json, command, &mut native_stop);
     if let Err(error) = result {
         print_error(json, &error, native_stop);
         std::process::exit(error.exit());
@@ -73,7 +76,7 @@ fn usage_error(_args: &[String], _detail: String) -> ContractError {
     ContractError::invariant("malformed command line; no state was changed")
 }
 
-fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
+fn dispatch(json: bool, command: Command, native_stop: &mut bool) -> Result<(), ContractError> {
     if matches!(command, Command::Hooks(HookCommand::Dispatch { .. })) {
         // The host, not kinbase, launched this process: drop what it leaked
         // instead of failing every hook (exit 4) on it.
@@ -406,7 +409,7 @@ fn dispatch(json: bool, command: Command) -> Result<(), ContractError> {
             crate::questions::dispatch(command, json).map_err(internal)?;
         }
         Command::Hooks(command) => {
-            crate::hooks::dispatch(command, json).map_err(internal)?;
+            crate::hooks::dispatch(command, json, native_stop).map_err(internal)?;
         }
     }
     Ok(())

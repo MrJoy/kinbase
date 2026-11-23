@@ -670,6 +670,20 @@ fn native_stop_reports_launcher_refusal_only_on_stderr() {
 }
 
 #[test]
+fn malformed_native_stop_command_reports_usage_only_on_stderr() {
+    for host in ["codex", "claude"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kinbase"))
+            .args(["hooks", "dispatch", host, "Stop", "--unexpected"])
+            .output_alone()
+            .expect("run malformed Stop command");
+        assert_eq!(output.status.code(), Some(4), "{host}: {output:?}");
+        assert!(output.stdout.is_empty(), "{host}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("malformed command line"), "{host}: {stderr}");
+    }
+}
+
+#[test]
 fn host_envelope_parser_folds_text_keeps_numbers_and_rejects_duplicates() {
     let value = kinbase::json::parse_host_envelope(
         "{\"a\":\"x\\ny\\u202ez\",\"n\":0.5,\"nested\":{\"k\\tv\":[\"p\\rq\"]}}".as_bytes(),
@@ -844,6 +858,17 @@ fn assert_held_admission_on_native_stop(host: &str) {
     assert_eq!(receipt["checkpointed"], true, "{host}: {receipt}");
     assert_eq!(receipt["session_id"], "host-session-4");
     assert!(receipt["envelope"].is_string(), "{host}: {receipt}");
+
+    // Make the checkpoint append fail after Stop is selected from stdin.
+    let checkpoint = world.personal.join("session-checkpoints.jsonl");
+    fs::rename(&checkpoint, world.personal.join("previous-checkpoint.jsonl"))
+        .expect("move checkpoint aside");
+    fs::create_dir(&checkpoint).expect("make checkpoint ledger unwritable");
+    let output = dispatch_host(&world, host, "native", stop.to_string().as_bytes(), false);
+    assert!(!output.status.success(), "{host}: {output:?}");
+    assert!(output.stdout.is_empty(), "{host}: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("evidence_id:"), "{host}: {stderr}");
 }
 
 #[test]
